@@ -1,0 +1,90 @@
+{
+  "domjudge_api": "http://localhost:8080/api/v4",
+  "lmstudio_api": "http://localhost:1234/v1",
+  "contest_id": "demo",
+  "language_id": "cpp",
+  "output_directory": "results",
+  "attempts": 5,
+  "repetitions": 5,
+  "temperature": 0.5,
+  "top_p": 0.95,
+  "max_tokens": 9096,
+  "seed": 2202,
+  "poll_interval_s": 2,
+  "judge_timeout_s": 600,
+  "generation_timeout_s": 600,
+  "api_timeout_s": 60,
+  "models": [
+    {
+      "label": "qwen",
+      "identifier": "",
+      "username": "llm-qwen",
+      "password_env": "",
+      "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version, GPU offload and thinking mode."
+    },
+    {
+      "label": "gemma",
+      "identifier": "",
+      "username": "llm-gemma",
+      "password_env": "",
+      "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version and GPU offload."
+    }
+  ],
+  "problems": [
+    {
+      "slug": "arithmeticadaptation",
+      "judge_id": "arithmeticadaptation",
+      "statement": "prompts/arithmeticadaptation.txt"
+    },
+    {
+      "slug": "bohemianbookshelf",
+      "judge_id": "bohemianbookshelf",
+      "statement": "prompts/bohemianbookshelf.txt"
+    },
+    {
+      "slug": "crochetcompetition",
+      "judge_id": "crochetcompetition",
+      "statement": "prompts/crochetcompetition.txt"
+    },
+    {
+      "slug": "dunedash",
+      "judge_id": "dunedash",
+      "statement": "prompts/dunedash.txt"
+    },
+    {
+      "slug": "egyptianequality",
+      "judge_id": "egyptianequality",
+      "statement": "prompts/egyptianequality.txt"
+    },
+    {
+      "slug": "followerforensics",
+      "judge_id": "followerforensics",
+      "statement": "prompts/followerforensics.txt"
+    },
+    {
+      "slug": "gottatradesomeofem",
+      "judge_id": "gottatradesomeofem",
+      "statement": "prompts/gottatradesomeofem.txt"
+    },
+    {
+      "slug": "hiddenpermutation",
+      "judge_id": "hiddenpermutation",
+      "statement": "prompts/hiddenpermutation.txt"
+    },
+    {
+      "slug": "instagraph",
+      "judge_id": "instagraph",
+      "statement": "prompts/instagraph.txt"
+    },
+    {
+      "slug": "jump",
+      "judge_id": "jump",
+      "statement": "prompts/jump.txt"
+    },
+    {
+      "slug": "kmh",
+      "judge_id": "kmh",
+      "statement": "prompts/kmh.txt"
+    }
+  ]
+}
