@@ -4,9 +4,7 @@ This bundle contains 11 individual NCPC 2025 problem imports, public problem pro
 
 ## 1. Fix the upload error
 
-Your original problemset archive exceeds PHP's 256M `post_max_size`. Extract **this starter bundle on your computer**. In the DOMjudge jury interface, import **one ZIP from `imports/` at a time**, starting with `arithmeticadaptation.zip`. Do not upload the outer starter ZIP as a problem. The largest individual import is approximately 35 MB, comfortably below the reported limit. No PHP or Docker Compose change is needed for these imports.
-
-The packages have their problem files at the ZIP root. Testcase symbolic links have been resolved, nested testcases flattened, and custom validators and original `problem.yaml` files retained. DOMjudge 9 reads the floating-point tolerance for Dune Dash from that metadata. Check the import messages and problem settings after each import. In particular, preserve the six custom output validators and Dune Dash's `float_tolerance 1e-6` comparison arguments.
+The original problemset archive exceeds Git's 25M `post_max_size`. Extract **instagraph.7z** in imports folder. In the DOMjudge jury interface, import **one ZIP from `imports/` at a time**, starting with `arithmeticadaptation.zip`. The largest individual import is approximately 35 MB, comfortably below the DOMServer limit. The packages have their problem files at the ZIP root.
 
 Create a contest, add the problems, enable submissions and judging, and set a contest window that covers the experiment. Create a team and linked **team user** named `llm-qwen`, and assign the team to the contest. Create a separate team/user `llm-gemma` when you add that model. The judgehost account is for the daemon; use team accounts for the harness. Confirm that your judgehost is active.
 
@@ -15,14 +13,6 @@ The supplied source archive has no official numeric per-problem time limit. DOMj
 ## 2. Install and load a model
 
 Start with **Qwen2.5-Coder-7B-Instruct, GGUF Q4_K_M**, subject to available memory. For a second family, try **Gemma 3 4B IT, GGUF Q4_K_M**. They differ in size: this initial comparison is of practical local configurations, rather than equal-sized architectures. Load only the model you are evaluating and start LM Studio's local server on port **1234**. An 8192-token context is a starting setting for these short prompts and the 4096-token response budget.
-
-The Predator PO7-655 name does not establish your installed GPU or VRAM. Run this in a terminal and record the output before selecting larger models:
-
-```text
-nvidia-smi --query-gpu=name,memory.total --format=csv
-```
-
-Record the exact model filename/quantization, LM Studio version, context size, GPU offload, GPU, VRAM and system RAM in each model's `notes` in `config.json`. Keep the same generation settings across models. Model identifiers must be the exact IDs returned by the server, not names guessed from a download page. If LM Studio server authentication is enabled, set `LMSTUDIO_API_KEY` in your terminal.
 
 ## 3. Configure and check the connection
 
@@ -36,14 +26,12 @@ Enter the `llm-qwen` team's password privately when asked. Alternatively, set `D
 
 Edit `config.json` with the contest ID, enabled C++ language ID, and Qwen's LM Studio model ID printed by `doctor`. Ensure the selected DOMjudge C++ compilation command uses C++17. Run `doctor` again to inspect the team's contest account and problem IDs. The starter assumes problem IDs match the imported external IDs; if your installation returns other IDs, update each `judge_id` to the value displayed. Keep all other settings unchanged for the pilot.
 
-Default endpoints, when running the harness on the same computer as your Docker deployment:
+Default endpoints, when running the harness on the same computer:
 
 | Service | Endpoint |
 | --- | --- |
 | DOMjudge | `http://localhost:8080/api/v4` |
 | LM Studio | `http://localhost:1234/v1` |
-
-Your provided Compose uses matching DOMserver/judgehost 9.0.0 images. This harness runs on the host computer; it does not need to be added to Compose.
 
 Submit one known reference solution to check the judge:
 
