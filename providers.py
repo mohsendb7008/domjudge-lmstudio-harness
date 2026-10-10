@@ -55,8 +55,14 @@ def generation_call(client, model, payload, cfg, api_error):
         try:
             return client.call('POST', generation_path(model), payload)
         except api_error as exc:
+            # These 429 errors require a billing/limit change, not a brief backoff.
+            if getattr(exc, 'error_code', None) in (
+                'insufficient_quota', 'credit_balance_exhausted', 'project_spend_limit_exceeded',
+                'organization_spend_limit_exceeded', 'usage_limit_exceeded'):
+                raise
             if retry >= cfg.get('generation_retries', 3) or exc.status not in (None, 429, 500, 502, 503, 504, 529):
                 raise
             delay = min(cfg.get('retry_backoff_s', 2) * 2 ** retry, 30)
-            print(f'Inference temporarily unavailable; retrying in {delay:g}s.', flush=True)
+            reason = f'HTTP {exc.status}' if exc.status is not None else 'connection failed or timed out'
+            print(f'Inference temporarily unavailable ({reason}); retrying in {delay:g}s.', flush=True)
             time.sleep(delay)

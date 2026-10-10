@@ -20,6 +20,7 @@ class ContestTests(unittest.TestCase):
     def setUp(self):
         self.requests=[];self.generations=[];self.selections=[];self.submissions=[];self.loads=[];self.unloads=[]
         self.hold=False;self.selection_invalid=False;self.fail_generation=0;self.fail_load=False
+        self.failure_status=429;self.failure_body={}
         test=self
         class Handler(BaseHTTPRequestHandler):
             def log_message(self,*args):pass
@@ -46,7 +47,7 @@ class ContestTests(unittest.TestCase):
                     test.unloads.append(payload);self.reply(payload);return
                 if self.path.endswith('/chat/completions') or self.path.endswith('/messages'):
                     if test.fail_generation:
-                        test.fail_generation-=1;self.reply({},429);return
+                        test.fail_generation-=1;self.reply(test.failure_body,test.failure_status);return
                     initial=payload['messages'][0]['content']
                     if initial.startswith('Choose the easiest'):
                         candidates=json.loads(initial.split('\n\n',1)[1])
@@ -90,6 +91,68 @@ class ContestTests(unittest.TestCase):
     def state(self,model,problem,repeat):
         path=self.root/'results'/model/problem/f'repeat-{repeat:02d}'/'state.json'
         return json.loads(path.read_text()) if path.exists() else None
+
+    def test_inference_error_reports_structured_detail_and_redacts_credentials(self):
+        self.fail_generation=1;self.failure_status=400
+        self.failure_body={'error':{'message':'Context exceeded\nsecret-openai sk-proj-example-secret Bearer another-key',
+                                    'code':'context_length_exceeded'},'request_dump':'PRIVATE_PROMPT'}
+        client=h.model_client(self.cfg,dict(self.cfg['models'][0],provider='openai',api_base=self.base+'/v1'))
+        with self.assertRaises(h.ApiError) as raised:client.call('POST','chat/completions',{})
+        error=raised.exception
+        self.assertEqual(error.status,400);self.assertEqual(error.error_code,'context_length_exceeded')
+        self.assertIn('Context exceeded',str(error));self.assertIn('[REDACTED]',str(error))
+        for secret in ('secret-openai','sk-proj-example-secret','another-key','PRIVATE_PROMPT','\n'):
+            self.assertNotIn(secret,str(error))
+
+    def test_anthropic_header_key_is_redacted(self):
+        self.fail_generation=1;self.failure_body={'error':{'message':'Invalid secret-claude'}}
+        model=dict(self.cfg['models'][0],provider='anthropic',api_base=self.base+'/v1')
+        with self.assertRaises(h.ApiError) as raised:h.model_client(self.cfg,model).call('POST','messages',{})
+        self.assertNotIn('secret-claude',str(raised.exception));self.assertIn('[REDACTED]',str(raised.exception))
+
+    def test_judge_error_keeps_server_body_private(self):
+        self.fail_generation=1;self.failure_body={'error':{'message':'PRIVATE_JUDGE_DETAIL'}}
+        with self.assertRaises(h.ApiError) as raised:h.Client(self.base+'/v1').call('POST','chat/completions',{})
+        self.assertNotIn('PRIVATE_JUDGE_DETAIL',str(raised.exception))
+
+    def test_error_detail_handles_unstructured_and_oversized_messages(self):
+        client=h.Client(self.base,inference=True)
+        for raw in (b'<html>private</html>',b'[]',b'{"error": null}',b'{"error": {"message": []}}'):
+            self.assertEqual(client.error_detail(raw),('',None))
+        detail,code=client.error_detail(json.dumps({'error':'x'*5000}).encode())
+        self.assertEqual(len(detail),800);self.assertIsNone(code)
+
+    def test_quota_error_stops_without_retry_and_selection_identifies_stage(self):
+        self.fail_generation=5;self.failure_status=429
+        self.failure_body={'error':{'message':'Add API credits','code':'insufficient_quota'}}
+        with self.assertRaises(h.ApiError) as raised:self.run_cli('--model','alpha')
+        self.assertEqual(self.fail_generation,4);self.assertEqual(len(self.requests),1)
+        self.assertIn('Problem selection failed:',str(raised.exception));self.assertIn('Add API credits',str(raised.exception))
+        self.assertEqual(self.submissions,[])
+
+    def test_probe_does_not_require_judge_ids_password_or_write_contest_state(self):
+        self.cfg['contest_id']=None;self.cfg['language_id']=None
+        file=self.root/'config.json';file.write_text(json.dumps(self.cfg))
+        with patch.dict(os.environ,{},clear=True),contextlib.redirect_stdout(io.StringIO()) as output:
+            h.main(['--config',str(file),'probe-model','--model','alpha'])
+        self.assertIn('Inference request succeeded',output.getvalue())
+        self.assertEqual(len(self.generations),1);self.assertEqual(self.generations[0]['max_tokens'],256)
+        self.assertEqual(self.generations[0]['messages'],[{'role':'user','content':'Reply with OK.'}])
+        self.assertEqual(self.submissions,[]);self.assertEqual(self.selections,[])
+        self.assertFalse((self.root/'results').exists())
+
+    def test_probe_error_is_immediate(self):
+        self.fail_generation=5;self.failure_status=400;self.failure_body={'error':'Channel Error'}
+        with self.assertRaisesRegex(h.ApiError,'HTTP 400. Channel Error'):
+            with contextlib.redirect_stdout(io.StringIO()):h.probe_model(dict(self.cfg,_root=str(self.root)),'alpha')
+        self.assertEqual(self.fail_generation,4);self.assertEqual(self.submissions,[])
+
+    def test_environment_field_rejects_literal_key_without_echoing_it(self):
+        self.cfg['models'][0]['api_key_env']='sk-proj-example-secret'
+        file=self.root/'config.json';file.write_text(json.dumps(self.cfg))
+        with self.assertRaises(h.HarnessError) as raised:h.load_config(file)
+        self.assertIn('environment variable',str(raised.exception))
+        self.assertNotIn('sk-proj-example-secret',str(raised.exception))
 
     def test_model_selects_and_finishes_attempts_round_two_hints_only(self):
         self.run_cli()

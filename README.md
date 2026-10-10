@@ -129,6 +129,26 @@ The prompt files contain original LaTeX statement text and public samples. Illus
 
 ## 6. Resume and troubleshoot
 
+Test the model separately from DOMjudge and the contest prompts:
+
+```text
+python harness.py probe-model --model gemma
+```
+
+Use your configured model label. This makes one short inference request with the configured loading mode and API credentials; it does not ask for a DOMjudge password, submit code, or change saved contest state. Cloud probes use the API and incur normal usage charges. A successful probe confirms a small request works; it does not guarantee enough context or memory for contest prompts.
+
+Inference HTTP errors now include the provider's structured error message/code, with configured credentials redacted and output bounded. Raw error bodies and DOMjudge error details are not printed. For LM Studio's generic **Channel Error**, inspect the LM Studio server log (or `lms log stream`) for the underlying model/runtime error. Record the LM Studio version and exact model ID. If the short probe also fails, first check the same model in LM Studio's own chat, its runtime, and its prompt template.
+
+If a probe succeeds but the run stops during **problem selection**, the selector request contains every remaining public statement. A context or memory error may require a larger loaded context or a smaller request. To test the smaller request, set `problem_selection` to `easiest`, reduce `max_tokens` to `4096` (including a per-model override if present), and choose a fresh `output_directory`, such as `results-gemma-pilot`. Then run a single problem:
+
+```text
+python harness.py run --model gemma --problem arithmeticadaptation --repeat 1
+```
+
+With manual loading (`auto_load_models: false`), configure the actual context size in LM Studio; the harness's model `context_length` applies only to automatic loading. `easiest` uses configured numeric difficulty and falls back to config order when difficulty is unknown. This bypasses model-based selection. It is a diagnostic experiment, not a guaranteed fix for a runtime or template failure.
+
+For cloud HTTP 429 errors, distinguish rate limits from quota/credit/spend-limit errors in the displayed provider message. Known quota and billing error codes stop immediately; transient errors still retry inference only. Never put a key in `api_key_env`: that field is an environment variable name such as `OPENAI_API_KEY`.
+
 Rerun the identical command to resume. Finished runs and accepted problems are skipped, and pending submissions are polled using their existing IDs. Changes to a run's prompt, model configuration, protocol settings or exposed judge metadata require a new `output_directory` to avoid mixing experiments.
 
 If the process loses contact **during submission**, the state may be `SUBMITTING`: the server may have accepted the submission without the client receiving its ID. The harness stops instead of submitting a duplicate. Inspect the DOMjudge jury submission list. If that submission exists, download its source from the jury UI, then attach it:
