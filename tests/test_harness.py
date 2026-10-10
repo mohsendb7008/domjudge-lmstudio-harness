@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import harness as h
@@ -131,6 +132,34 @@ class IntegrationTests(unittest.TestCase):
         self.run_job();self.cfg['temperature']=0.8
         with self.assertRaisesRegex(h.HarnessError,'Configuration changed'):self.run_job()
 
+    def test_interrupt_after_generation_saves_source_before_any_submission(self):
+        stop=threading.Event();original=h.generation_call
+        def cancel_after_response(*args,**kwargs):
+            result=original(*args,**kwargs);stop.set();return result
+        with patch.object(h,'generation_call',side_effect=cancel_after_response):
+            with self.assertRaises(h.RunCancelled):
+                h.run_job(self.cfg,self.model,self.problem,1,self.dj,self.lm,self.metadata,stop)
+        self.assertEqual(self.state()['attempts'][0]['status'],'GENERATED')
+        self.assertEqual(len(self.backend.submissions),0)
+        self.run_job()
+        self.assertEqual(len(self.backend.generations),2)
+        self.assertEqual(len(self.backend.submissions),2)
+
+    def test_interrupt_after_submission_keeps_pending_id_and_never_reposts(self):
+        stop=threading.Event();original=self.dj.call
+        def cancel_after_submission(method,path,*args,**kwargs):
+            result=original(method,path,*args,**kwargs)
+            if method=='POST':stop.set()
+            return result
+        with patch.object(self.dj,'call',side_effect=cancel_after_submission):
+            with self.assertRaises(h.RunCancelled):
+                h.run_job(self.cfg,self.model,self.problem,1,self.dj,self.lm,self.metadata,stop)
+        first=self.state()['attempts'][0]
+        self.assertEqual((first['status'],first['submission_id']),('PENDING','1'))
+        self.run_job()
+        self.assertEqual(len(self.backend.submissions),2)
+        self.assertEqual([a['submission_id'] for a in self.state()['attempts']],['1','2'])
+
 
 class ProtocolTests(unittest.TestCase):
     def test_final_judgement_waits_for_latest_valid_completion(self):
@@ -147,3 +176,4 @@ class ProtocolTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+

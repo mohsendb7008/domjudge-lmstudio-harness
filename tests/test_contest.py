@@ -21,6 +21,8 @@ class ContestTests(unittest.TestCase):
         self.requests=[];self.generations=[];self.selections=[];self.submissions=[];self.loads=[];self.unloads=[]
         self.hold=False;self.selection_invalid=False;self.fail_generation=0;self.fail_load=False
         self.failure_status=429;self.failure_body={}
+        self.backend_lock=threading.Lock();self.fail_models=set()
+        self.generation_barrier=None;self.barrier_seen=set()
         test=self
         class Handler(BaseHTTPRequestHandler):
             def log_message(self,*args):pass
@@ -46,6 +48,8 @@ class ContestTests(unittest.TestCase):
                 if self.path=='/api/v1/models/unload':
                     test.unloads.append(payload);self.reply(payload);return
                 if self.path.endswith('/chat/completions') or self.path.endswith('/messages'):
+                    if payload.get('model') in test.fail_models:
+                        self.reply({'error':'Model runtime failed'},400);return
                     if test.fail_generation:
                         test.fail_generation-=1;self.reply(test.failure_body,test.failure_status);return
                     initial=payload['messages'][0]['content']
@@ -54,8 +58,15 @@ class ContestTests(unittest.TestCase):
                         test.selections.append(payload)
                         content='bad selection' if test.selection_invalid else json.dumps({'problem':candidates[-1]['slug']})
                     else:
-                        test.generations.append(payload)
-                        content='```cpp\nint main(){return 0;} // generation'+str(len(test.generations))+'\n```'
+                        with test.backend_lock:
+                            wait=test.generation_barrier is not None and payload['model'] not in test.barrier_seen
+                            test.barrier_seen.add(payload['model'])
+                        if wait:
+                            try:test.generation_barrier.wait(timeout=3)
+                            except threading.BrokenBarrierError:self.reply({'error':'Models did not overlap'},400);return
+                        with test.backend_lock:
+                            test.generations.append(payload);number=len(test.generations)
+                        content='```cpp\nint main(){return 0;} // generation'+str(number)+'\n```'
                     if self.path.endswith('/messages'):
                         self.reply({'content':[{'type':'text','text':content}],'stop_reason':'end_turn',
                                     'usage':{'input_tokens':7,'output_tokens':9}})
@@ -67,7 +78,9 @@ class ContestTests(unittest.TestCase):
                     n=int(source.split('generation')[1].strip())
                     generation=test.generations[n-1];initial=generation['messages'][0]['content']
                     verdict='AC' if payload['problem']=='p1' and (generation['model'].startswith('beta') or 'HINT_p1' in initial) else 'WA'
-                    test.submissions.append(dict(payload,verdict=verdict));self.reply({'id':str(len(test.submissions))},201)
+                    with test.backend_lock:
+                        test.submissions.append(dict(payload,verdict=verdict));number=len(test.submissions)
+                    self.reply({'id':str(number)},201)
                 else:self.reply({},404)
         self.server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
@@ -158,8 +171,8 @@ class ContestTests(unittest.TestCase):
         self.run_cli()
         jobs=json.loads((self.root/'results/contest.json').read_text())['jobs']
         self.assertEqual([(j['repeat'],j['model'],j['problem']) for j in jobs],
-                         [(1,'alpha','p2'),(1,'alpha','p1'),(1,'beta','p2'),(1,'beta','p1'),
-                          (2,'alpha','p2'),(2,'alpha','p1'),(2,'beta','p2')])
+                         [(1,'alpha','p2'),(2,'alpha','p2'),(1,'alpha','p1'),(2,'alpha','p1'),
+                          (1,'beta','p2'),(2,'beta','p2'),(1,'beta','p1')])
         self.assertEqual(self.state('alpha','p1',1)['status'],'EXHAUSTED')
         self.assertEqual(self.state('alpha','p1',2)['status'],'ACCEPTED')
         self.assertIsNone(self.state('beta','p1',2))
@@ -190,7 +203,7 @@ class ContestTests(unittest.TestCase):
         with self.assertRaisesRegex(h.HarnessError,'stays pending'):self.run_cli('--model','alpha')
         self.assertEqual((len(self.selections),len(self.generations),len(self.submissions)),(1,1,1))
         self.hold=False;self.run_cli('--model','alpha')
-        self.assertEqual(len(self.selections),4)
+        self.assertEqual(len(self.selections),2)
         self.assertEqual(len(self.submissions),7)
 
     def test_selected_job_survives_crash_before_job_state(self):
@@ -223,10 +236,10 @@ class ContestTests(unittest.TestCase):
         self.run_cli('--model','beta','--repeat','1')
         self.assertEqual(self.state('beta','p1',1)['status'],'ACCEPTED')
 
-    def test_lmstudio_load_unload_each_active_model_round(self):
+    def test_lmstudio_load_unload_once_per_model(self):
         self.cfg['auto_load_models']=True;self.run_cli()
-        self.assertEqual([p['model'] for p in self.loads],['alpha','beta','alpha','beta'])
-        self.assertEqual([p['instance_id'] for p in self.unloads],['alpha-instance','beta-instance','alpha-instance','beta-instance'])
+        self.assertEqual([p['model'] for p in self.loads],['alpha','beta'])
+        self.assertEqual([p['instance_id'] for p in self.unloads],['alpha-instance','beta-instance'])
         self.assertTrue(all(g['model'].endswith('-instance') for g in self.generations))
 
     def test_load_failure_does_not_generate_or_submit(self):
@@ -281,6 +294,121 @@ class ContestTests(unittest.TestCase):
         self.assertEqual((len(self.generations),len(self.submissions)),(1,1))
         self.assertEqual(len(self.state('beta','p1',1)['attempts']),1)
 
+    def test_parallel_models_overlap_and_finish_all_rounds_per_problem(self):
+        self.cfg.update(parallel_models=2,lmstudio_parallel_models=2,repetitions=3,problem_selection='easiest')
+        self.generation_barrier=threading.Barrier(2)
+        self.run_cli()
+        self.assertEqual(self.barrier_seen,{'alpha','beta'})
+        manifest=json.loads((self.root/'results/contest.json').read_text())
+        for label,expected in [('alpha',[(1,'p1'),(2,'p1'),(1,'p2'),(2,'p2'),(3,'p2')]),
+                               ('beta',[(1,'p1'),(1,'p2'),(2,'p2'),(3,'p2')])]:
+            self.assertEqual([(j['repeat'],j['problem']) for j in manifest['jobs'] if j['model']==label],expected)
+            self.assertEqual(manifest['model_status'][label]['status'],'COMPLETED')
+            self.assertTrue(self.state(label,'p2',3)['hint_used'])
+            self.assertIn('Round 3 hint:',self.state(label,'p2',3)['messages'][0]['content'])
+        keys=[(j['model'],j['problem'],j['repeat']) for j in manifest['jobs']]
+        self.assertEqual(len(keys),len(set(keys)));self.assertEqual(len(keys),9)
+        self.assertIsNone(self.state('alpha','p1',3));self.assertIsNone(self.state('beta','p1',2))
+        generations=len(self.generations);submissions=len(self.submissions)
+        # Operational worker limits can be reduced on resume without redoing solutions.
+        self.cfg.update(parallel_models=1,lmstudio_parallel_models=1);self.run_cli()
+        self.assertEqual((len(self.generations),len(self.submissions)),(generations,submissions))
+        self.assertEqual(len(json.loads((self.root/'results/contest.json').read_text())['executions']),2)
+
+    def test_cloud_and_local_models_overlap_with_local_limit_one(self):
+        self.cfg.update(parallel_models=2,lmstudio_parallel_models=1,problem_selection='configured')
+        self.cfg['models'][1].update(provider='openai',api_base=self.base+'/v1')
+        self.generation_barrier=threading.Barrier(2)
+        self.run_cli('--problem','p1')
+        self.assertEqual(self.barrier_seen,{'alpha','beta'})
+        self.assertEqual(self.state('alpha','p1',2)['status'],'ACCEPTED')
+        self.assertEqual(self.state('beta','p1',1)['status'],'ACCEPTED')
+
+    def test_local_limit_and_duplicate_instance_serialize_model_sessions(self):
+        for duplicate in (False,True):
+            with self.subTest(duplicate=duplicate):
+                self.cfg.update(parallel_models=2,lmstudio_parallel_models=2 if duplicate else 1,
+                                problem_selection='configured',auto_load_models=True,output_directory='serialized-'+str(duplicate))
+                if duplicate:self.cfg['models'][1]['identifier']='alpha'
+                original=h.model_session;active=0;maximum=0;guard=threading.Lock()
+                @contextlib.contextmanager
+                def tracked(cfg,model):
+                    nonlocal active,maximum
+                    with original(cfg,model) as client:
+                        with guard:active+=1;maximum=max(maximum,active)
+                        try:yield client
+                        finally:
+                            with guard:active-=1
+                with patch.object(h,'model_session',tracked):self.run_cli('--problem','p1')
+                self.assertEqual(maximum,1);self.assertEqual(active,0)
+        self.assertEqual(len(self.loads),4);self.assertEqual(len(self.unloads),4)
+
+    def test_failed_model_does_not_stop_other_model_and_resumes_later(self):
+        self.cfg.update(parallel_models=2,lmstudio_parallel_models=2,problem_selection='configured')
+        self.fail_models={'alpha'}
+        with contextlib.redirect_stderr(io.StringIO()),self.assertRaisesRegex(h.HarnessError,'alpha:.*Model runtime failed'):
+            self.run_cli('--problem','p1')
+        self.assertEqual(self.state('beta','p1',1)['status'],'ACCEPTED')
+        self.assertEqual(self.state('alpha','p1',1)['attempts'][0]['status'],'GENERATING')
+        manifest=json.loads((self.root/'results/contest.json').read_text())
+        self.assertEqual(manifest['model_status']['alpha']['status'],'FAILED')
+        self.assertEqual(manifest['model_status']['beta']['status'],'COMPLETED')
+        beta_generations=sum(g['model']=='beta' for g in self.generations)
+        self.fail_models.clear();self.run_cli('--problem','p1')
+        self.assertEqual(sum(g['model']=='beta' for g in self.generations),beta_generations)
+        self.assertEqual(self.state('alpha','p1',2)['status'],'ACCEPTED')
+
+    def test_resume_round_two_before_selecting_another_problem(self):
+        self.cfg['repetitions']=3;original=h.run_job
+        def crash_on_round_two(*args,**kwargs):
+            if args[3]==2:raise RuntimeError('round two crash')
+            return original(*args,**kwargs)
+        with patch.object(h,'run_job',side_effect=crash_on_round_two):
+            with self.assertRaisesRegex(RuntimeError,'round two crash'):self.run_cli('--model','alpha')
+        self.assertEqual(len(self.selections),1);self.assertEqual(len(self.generations),2)
+        self.assertEqual(self.state('alpha','p2',1)['status'],'EXHAUSTED')
+        self.run_cli('--model','alpha')
+        self.assertIn('HINT_p2',self.generations[2]['messages'][0]['content'])
+        self.assertIn('Round 3 hint:',self.generations[4]['messages'][0]['content'])
+        self.assertEqual(len(self.selections),2)
+
+    def test_explicit_third_round_requires_both_earlier_rounds(self):
+        self.cfg.update(repetitions=3,problem_selection='configured')
+        self.run_cli('--model','alpha','--problem','p2','--repeat','1')
+        with self.assertRaisesRegex(h.HarnessError,'Finish round 2'):
+            self.run_cli('--model','alpha','--problem','p2','--repeat','3')
+        self.run_cli('--model','alpha','--problem','p2','--repeat','2')
+        self.run_cli('--model','alpha','--problem','p2','--repeat','3')
+        self.assertEqual(len(self.submissions),6)
+        self.assertTrue(self.state('alpha','p2',3)['hint_used'])
+
+    def test_legacy_contest_requires_a_new_output_directory(self):
+        self.run_cli('--model','beta','--problem','p1')
+        file=self.root/'results/contest.json';manifest=json.loads(file.read_text());manifest.pop('scheduler')
+        file.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(h.HarnessError,'previous round order'):self.run_cli('--model','beta','--problem','p1')
+
+    def test_invalid_worker_override_stops_before_inference(self):
+        with self.assertRaisesRegex(h.HarnessError,'parallel_models'):self.run_cli('--parallel-models','0')
+        self.assertEqual(self.generations,[])
+
+    def test_ctrl_c_joins_workers_and_unloads_before_export(self):
+        self.cfg.update(parallel_models=2,lmstudio_parallel_models=2,problem_selection='configured',auto_load_models=True)
+        started=threading.Barrier(3)
+        def waiting_job(*args,**kwargs):
+            stop=args[7];started.wait(timeout=3)
+            self.assertTrue(stop.wait(3));h.check_cancelled(stop)
+        def interrupt(futures):
+            started.wait(timeout=3);raise KeyboardInterrupt()
+        with patch.object(h,'run_job',side_effect=waiting_job),patch.object(h,'as_completed',side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):self.run_cli('--problem','p1')
+        manifest=json.loads((self.root/'results/contest.json').read_text())
+        self.assertTrue(manifest['executions'][-1]['interrupted'])
+        self.assertTrue(all(s['status']=='INTERRUPTED' for s in manifest['model_status'].values()))
+        self.assertEqual(len(self.unloads),2)
+        self.assertTrue((self.root/'results/scoreboard.json').exists())
+        self.assertFalse(any(t.name.startswith('contest-model') for t in threading.enumerate()))
+
 
 class ConfigTests(unittest.TestCase):
     def test_validations_and_round_one_hint_isolation(self):
@@ -290,7 +418,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(h.hidden_hint(cfg,cfg['problems'][0],2),'private')
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as d:
             path=Path(d)/'config.json'
-            for field,value in [('attempts',11),('repetitions',3),('attempts',True),('problem_selection','random')]:
+            for field,value in [('attempts',11),('repetitions',101),('attempts',True),('problem_selection','random'),
+                                ('parallel_models',0),('parallel_models',True),('lmstudio_parallel_models',33)]:
                 with self.subTest(field=field,value=value):
                     path.write_text(json.dumps(dict(cfg,**{field:value})))
                     with self.assertRaises(h.HarnessError):h.load_config(path)
