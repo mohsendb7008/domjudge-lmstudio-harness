@@ -49,9 +49,11 @@ def response_content(response, model):
     return choice['message'].get('content', ''), response.get('usage', {}), choice.get('finish_reason')
 
 
-def generation_call(client, model, payload, cfg, api_error):
+def generation_call(client, model, payload, cfg, api_error, stop_event=None):
     """Retry inference only; DOMjudge submissions must never be blindly retried."""
     for retry in range(cfg.get('generation_retries', 3) + 1):
+        if stop_event is not None and stop_event.is_set():
+            raise api_error('Inference interrupted; saved work can be resumed.')
         try:
             return client.call('POST', generation_path(model), payload)
         except api_error as exc:
@@ -64,5 +66,8 @@ def generation_call(client, model, payload, cfg, api_error):
                 raise
             delay = min(cfg.get('retry_backoff_s', 2) * 2 ** retry, 30)
             reason = f'HTTP {exc.status}' if exc.status is not None else 'connection failed or timed out'
-            print(f'Inference temporarily unavailable ({reason}); retrying in {delay:g}s.', flush=True)
-            time.sleep(delay)
+            print(f'{model["label"]}: inference temporarily unavailable ({reason}); retrying in {delay:g}s.', flush=True)
+            if stop_event is None:
+                time.sleep(delay)
+            elif stop_event.wait(delay):
+                raise api_error('Inference interrupted before retry; saved work can be resumed.')

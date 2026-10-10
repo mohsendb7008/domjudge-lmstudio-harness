@@ -3,9 +3,9 @@
   "lmstudio_api": "http://localhost:1234/v1",
   "contest_id": "demo",
   "language_id": "cpp",
-  "output_directory": "results-contest",
-  "attempts": 10,
-  "repetitions": 2,
+  "output_directory": "results-contest2",
+  "attempts": 3,
+  "repetitions": 3,
   "temperature": 0.5,
   "top_p": 0.95,
   "max_tokens": 9096,
@@ -17,7 +17,7 @@
   "models": [
     {
       "label": "qwen",
-      "identifier": "",
+      "identifier": "qwen2.5-coder-7b-instruct",
       "username": "llm-qwen",
       "password_env": "DOMJUDGE_PASSWORD_QWEN",
       "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version, GPU offload and thinking mode.",
@@ -28,12 +28,12 @@
     },
     {
       "label": "gemma",
-      "identifier": "",
+      "identifier": "gemma-3-4b-it",
       "username": "llm-gemma",
       "password_env": "DOMJUDGE_PASSWORD_GEMMA",
       "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version and GPU offload.",
       "provider": "lmstudio",
-      "enabled": false,
+      "enabled": true,
       "api_key_env": "LMSTUDIO_API_KEY",
       "context_length": 32768
     },
@@ -41,8 +41,8 @@
       "label": "openai",
       "provider": "openai",
       "enabled": false,
-      "identifier": "REPLACE_WITH_OPENAI_MODEL_ID",
-      "username": "llm-openai",
+      "identifier": "gpt-5.5",
+      "username": "llm-chatgpt",
       "password_env": "DOMJUDGE_PASSWORD_OPENAI",
       "api_key_env": "OPENAI_API_KEY"
     },
@@ -61,82 +61,82 @@
       "slug": "arithmeticadaptation",
       "judge_id": "arithmeticadaptation",
       "statement": "prompts/arithmeticadaptation.txt",
-      "difficulty": null,
+      "difficulty": 1,
       "hidden_hint": ""
     },
     {
       "slug": "bohemianbookshelf",
       "judge_id": "bohemianbookshelf",
       "statement": "prompts/bohemianbookshelf.txt",
-      "difficulty": null,
+      "difficulty": 7,
       "hidden_hint": ""
     },
     {
       "slug": "crochetcompetition",
       "judge_id": "crochetcompetition",
       "statement": "prompts/crochetcompetition.txt",
-      "difficulty": null,
+      "difficulty": 2,
       "hidden_hint": ""
     },
     {
       "slug": "dunedash",
       "judge_id": "dunedash",
       "statement": "prompts/dunedash.txt",
-      "difficulty": null,
+      "difficulty": 8,
       "hidden_hint": ""
     },
     {
       "slug": "egyptianequality",
       "judge_id": "egyptianequality",
       "statement": "prompts/egyptianequality.txt",
-      "difficulty": null,
+      "difficulty": 10,
       "hidden_hint": ""
     },
     {
       "slug": "followerforensics",
       "judge_id": "followerforensics",
       "statement": "prompts/followerforensics.txt",
-      "difficulty": null,
+      "difficulty": 11,
       "hidden_hint": ""
     },
     {
       "slug": "gottatradesomeofem",
       "judge_id": "gottatradesomeofem",
       "statement": "prompts/gottatradesomeofem.txt",
-      "difficulty": null,
+      "difficulty": 5,
       "hidden_hint": ""
     },
     {
       "slug": "hiddenpermutation",
       "judge_id": "hiddenpermutation",
       "statement": "prompts/hiddenpermutation.txt",
-      "difficulty": null,
+      "difficulty": 9,
       "hidden_hint": ""
     },
     {
       "slug": "instagraph",
       "judge_id": "instagraph",
       "statement": "prompts/instagraph.txt",
-      "difficulty": null,
+      "difficulty": 4,
       "hidden_hint": ""
     },
     {
       "slug": "jump",
       "judge_id": "jump",
       "statement": "prompts/jump.txt",
-      "difficulty": null,
+      "difficulty": 6,
       "hidden_hint": ""
     },
     {
       "slug": "kmh",
       "judge_id": "kmh",
       "statement": "prompts/kmh.txt",
-      "difficulty": null,
+      "difficulty": 3,
       "hidden_hint": ""
     }
   ],
-  "problem_selection": "model",
-  "auto_load_models": true,
+  "problem_selection": "easiest",
+  "auto_load_models": false,
   "lmstudio_management_api": "http://localhost:1234/api/v1",
   "openai_api": "https://api.openai.com/v1",
   "anthropic_api": "https://api.anthropic.com/v1",
@@ -155,5 +155,7 @@
     "instagraph": "The centrality of v is exactly the number of incoming edges u -> v whose reverse v -> u is absent: all such followers can simultaneously be in the celebrity's group, and mutual followers cannot. Store all directed edges using a packed 64-bit key u*N+v in a hash set, or sort these keys and binary-search reversed keys, then increment v's score only for nonreciprocated incoming edges. Expected O(N+M) hashing or O(M log M) sorting avoids an infeasible N-by-N matrix. Cast to 64-bit before forming keys, preserve the input's edge direction, and scan vertex IDs in increasing order, replacing the answer only on a strictly larger score so ties choose the smallest ID. With no edges the answer is vertex 1 with score 0. C++17 offers efficient memory use for up to a million edges.",
     "jump": "Jump between beat landings instead of simulating every jump: immediately after a beat the time residue is zero, and the next beat after s jumps satisfies s*E - s*(s-1)/2 congruent to 0 modulo N. For each energy residue E modulo N, precompute the smallest positive s <= 2N by enumerating s and solving 2*s*E congruent to s*(s-1) modulo 2N with gcd reduction and a modular inverse, populating every solution residue. If E <= s-1, he collapses before that beat and the remaining time is E*(E+1)/2; otherwise add s*E - s*(s-1)/2 and update E to E-s+2. The next energy residue is deterministic, so detect a repeated residue, record the cycle's energy change, its affine time cost, and the lowest energy reached inside it. A nonnegative cycle energy change implies infinity once the full cycle is feasible; a negative change allows skipping many cycles with an arithmetic-series time sum, stopping before any jump could launch at zero energy. Raw simulation with E up to 10^9 and cycle detection on residue alone without tracking energy are incorrect approaches. C++17 with 64-bit state and __int128 intermediate sums is recommended.",
     "kmh": "Maintain the greatest numeric speed-limit sign seen so far. A numeric sign directly sets the current legal speed to its own number; a '/' sign restores the unknown national speed limit, whose smallest possible value is the smallest multiple of ten strictly greater than that historical maximum, namely 10*(maximum/10+1). That lower bound is the fastest speed guaranteed legal from the information seen so far. Process signs online and print one answer per sign: later evidence must not change earlier answers, and a lower recent sign must not erase an older higher maximum. In particular, if the maximum is already a multiple of ten, the national lower bound is still the next multiple, not the same one. C++17 with ordinary integers is sufficient."
-  }
+  },
+  "parallel_models": 2,
+  "lmstudio_parallel_models": 2
 }

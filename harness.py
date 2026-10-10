@@ -5,8 +5,9 @@ No generated program is executed by this process; DOMjudge handles judging.
 The default protocol returns verdicts only, never secret test data.
 """
 import argparse, base64, csv, getpass, hashlib, io, json, os, re, statistics
-import sys, time, zipfile
-from contextlib import contextmanager
+import sys, time, zipfile, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -16,6 +17,7 @@ from providers import (PROVIDERS, provider_name, generation_payload,
                        response_content, generation_call, generation_path)
 
 class HarnessError(Exception): pass
+class RunCancelled(HarnessError): pass
 class ApiError(HarnessError):
     def __init__(self,message,status=None,error_code=None):
         super().__init__(message);self.status=status;self.error_code=error_code
@@ -26,6 +28,8 @@ def atomic_json(path,data):
     tmp=path.with_suffix(path.suffix+'.tmp')
     tmp.write_text(json.dumps(data,indent=2,ensure_ascii=False),encoding='utf-8');tmp.replace(path)
 def sha(value):return hashlib.sha256(value.encode()).hexdigest()
+def check_cancelled(stop_event):
+    if stop_event is not None and stop_event.is_set():raise RunCancelled('Run interrupted; saved work can be resumed.')
 
 class Client:
     def __init__(self,base,username=None,password=None,key=None,timeout=60,inference=False):
@@ -131,7 +135,8 @@ def load_config(path):
     for k in ['domjudge_api','lmstudio_api','openai_api','anthropic_api','lmstudio_management_api']:
         if k in cfg and urlsplit(cfg[k]).scheme not in ['http','https']:raise HarnessError(k+' must be an HTTP(S) URL.')
     if not cfg.get('domjudge_api'):raise HarnessError('Set domjudge_api.')
-    for k,default,lower,upper in [('attempts',10,1,10),('repetitions',2,1,2),('generation_retries',3,0,10)]:
+    for k,default,lower,upper in [('attempts',10,1,10),('repetitions',2,1,100),('generation_retries',3,0,10),
+                                ('parallel_models',1,1,32),('lmstudio_parallel_models',1,1,32)]:
         value=cfg.get(k,default)
         if type(value)!=int or not lower<=value<=upper:raise HarnessError(f'{k} must be an integer between {lower} and {upper}.')
     if cfg.get('problem_selection','model') not in ['model','easiest','configured']:
@@ -211,14 +216,17 @@ def final_judgement(items,submission_id):
     newest=max(matches,key=lambda j:int(j['id']))
     return newest if newest.get('end_time') and newest.get('judgement_type_id') else None
 
-def wait_for_judgement(dj,cfg,submission_id):
+def wait_for_judgement(dj,cfg,submission_id,stop_event=None):
     start=time.monotonic()
     while True:
+        check_cancelled(stop_event)
         result=final_judgement(dj.call('GET',contest_path(cfg['contest_id'],'judgements')),submission_id)
         if result:return result,time.monotonic()-start
         if time.monotonic()-start>=cfg.get('judge_timeout_s',600):
             raise HarnessError('Judging timed out. This attempt stays pending; rerun to poll the same submission.')
-        time.sleep(cfg.get('poll_interval_s',2))
+        delay=cfg.get('poll_interval_s',2)
+        if stop_event is None:time.sleep(delay)
+        else:stop_event.wait(delay)
 
 def save_state(folder,state):atomic_json(folder/'state.json',state)
 def protocol_config(cfg,model,problem,prompt):
@@ -226,7 +234,7 @@ def protocol_config(cfg,model,problem,prompt):
     return {k:cfg.get(k,defaults.get(k)) for k in ['domjudge_api','lmstudio_api','openai_api','anthropic_api','contest_id','language_id','attempts','repetitions','temperature','top_p','max_tokens','seed','problem_selection']}
 
 def hidden_hint(cfg,problem,repeat):
-    return (problem.get('hidden_hint') or cfg.get('hidden_hints',{}).get(problem['slug'],'')) if repeat==2 else ''
+    return (problem.get('hidden_hint') or cfg.get('hidden_hints',{}).get(problem['slug'],'')) if repeat>=2 else ''
 
 def generation_messages(state):
     # Keep the full audit history on disk, but send only the latest repair exchange.
@@ -234,7 +242,7 @@ def generation_messages(state):
     messages=state['messages']
     return messages if len(messages)<=3 else [messages[0],*messages[-2:]]
 
-def run_job(cfg,model,problem,repeat,dj,lm,metadata):
+def run_job(cfg,model,problem,repeat,dj,lm,metadata,stop_event=None):
     root=Path(cfg['_root']);prompt=(root/problem['statement']).read_text(encoding='utf-8')
     instruction=('Solve this competitive programming problem. Return exactly one complete C++17 program '
                  'inside a single ```cpp code block. Read standard input and write standard output. '
@@ -242,7 +250,7 @@ def run_job(cfg,model,problem,repeat,dj,lm,metadata):
     limits=metadata['problem']
     initial=instruction+'DOMjudge problem configuration:\n'+json.dumps({k:limits[k] for k in ['time_limit','memory_limit'] if k in limits})+'\n\n'+prompt
     hint=hidden_hint(cfg,problem,repeat)
-    if hint:initial+='\n\nRound 2 hint:\n'+hint
+    if hint:initial+=f'\n\nRound {repeat} hint:\n'+hint
     fingerprint=sha(json.dumps({'settings':protocol_config(cfg,model,problem,prompt),
                                'model':{k:v for k,v in model.items() if 'password' not in k},
                                'problem':problem,'prompt':initial,'metadata':metadata},sort_keys=True))
@@ -261,6 +269,7 @@ def run_job(cfg,model,problem,repeat,dj,lm,metadata):
         save_state(folder,state)
     if state['status'] in ['ACCEPTED','EXHAUSTED']:return
     while len(state['attempts'])<cfg.get('attempts',10) or (state['attempts'] and state['attempts'][-1]['status']!='DONE'):
+        check_cancelled(stop_event)
         if state['attempts'] and state['attempts'][-1]['status']!='DONE':
             attempt=state['attempts'][-1]
         else:
@@ -272,7 +281,7 @@ def run_job(cfg,model,problem,repeat,dj,lm,metadata):
         if attempt['status']=='GENERATING':
             payload=generation_payload(cfg,model,generation_messages(state),repeat,getattr(lm,'model_id',None))
             atomic_json(folder/(prefix+'-request.json'),payload)
-            started=time.monotonic();response=generation_call(lm,model,payload,cfg,ApiError)
+            started=time.monotonic();response=generation_call(lm,model,payload,cfg,ApiError,stop_event)
             attempt['generation_s']=time.monotonic()-started
             atomic_json(folder/(prefix+'-response.json'),response)
             content=''
@@ -294,6 +303,7 @@ def run_job(cfg,model,problem,repeat,dj,lm,metadata):
             state['messages'].append({'role':'assistant','content':content})
             save_state(folder,state)
         if attempt['status']=='GENERATED':
+            check_cancelled(stop_event)
             code=(folder/(prefix+'.cpp')).read_text(encoding='utf-8')
             attempt.update(status='SUBMITTING',submit_started_at=now());save_state(folder,state)
             try:
@@ -307,7 +317,7 @@ def run_job(cfg,model,problem,repeat,dj,lm,metadata):
             attempt.update(status='PENDING',submission_id=str(result['id']),submission_response=result)
             save_state(folder,state)
         if attempt['status']=='PENDING':
-            judgement,wait_s=wait_for_judgement(dj,cfg,attempt['submission_id'])
+            judgement,wait_s=wait_for_judgement(dj,cfg,attempt['submission_id'],stop_event)
             verdict=judgement['judgement_type_id']
             attempt.update(status='DONE',verdict=verdict,judgement=judgement,
                            judge_poll_wait_s=attempt.get('judge_poll_wait_s',0)+wait_s,
@@ -336,7 +346,7 @@ def easiest_problem(problems):
     # Stable config order breaks ties and is the fallback when difficulty is unknown.
     return min(problems,key=lambda p:p.get('difficulty') if p.get('difficulty') is not None else float('inf'))
 
-def select_problem(cfg,model,problems,repeat,lm,folder,index):
+def select_problem(cfg,model,problems,repeat,lm,folder,index,stop_event=None):
     policy=cfg.get('problem_selection','model')
     if policy=='configured':return problems[0]
     if policy=='easiest':return easiest_problem(problems)
@@ -350,7 +360,7 @@ def select_problem(cfg,model,problems,repeat,lm,folder,index):
                                repeat,getattr(lm,'model_id',None),selection=True)
     atomic_json(folder/f'selection-{index:03d}-request.json',payload)
     print(f'Selecting a problem with {model["label"]}: {len(problems)} public statements.',flush=True)
-    try:response=generation_call(lm,model,payload,cfg,ApiError)
+    try:response=generation_call(lm,model,payload,cfg,ApiError,stop_event)
     except ApiError as exc:
         raise ApiError('Problem selection failed: '+str(exc),exc.status,exc.error_code) from None
     atomic_json(folder/f'selection-{index:03d}-response.json',response)
@@ -365,6 +375,13 @@ def select_problem(cfg,model,problems,repeat,lm,folder,index):
         print('Invalid problem selection; using configured difficulty/order fallback.',flush=True)
         return easiest_problem(problems)
 
+@contextmanager
+def resource_slot(gate,stop_event):
+    while not gate.acquire(timeout=0.2):check_cancelled(stop_event)
+    try:
+        check_cancelled(stop_event);yield
+    finally:gate.release()
+
 def run_contest(cfg,models,problems,repetitions):
     out=Path(cfg['_root'])/cfg.get('output_directory','results');out.mkdir(parents=True,exist_ok=True)
     # Resolve credentials and validate every selected team before a long unattended run.
@@ -376,50 +393,118 @@ def run_contest(cfg,models,problems,repetitions):
         for p in problems:
             metadata[(model['label'],p['slug'])]=validate_problem(clients[model['label']],cfg,p)
         model_client(cfg,model)  # Check cloud credentials before any generation.
-    if repetitions[0]==2:
+    if repetitions[0]>1:
         for model in models:
-            if any((read_job(cfg,model,p,1) or {}).get('status') not in ['ACCEPTED','EXHAUSTED'] for p in problems):
-                raise HarnessError('Finish round 1 before selecting --repeat 2; run without --repeat to do both.')
+            for n in range(1,repetitions[0]):
+                if any(not is_solved(cfg,model,p) and (read_job(cfg,model,p,n) or {}).get('status')!='EXHAUSTED' for p in problems):
+                    raise HarnessError(f'Finish round {n} before selecting --repeat {repetitions[0]}; run without --repeat to do all rounds.')
     manifest_path=out/'contest.json'
-    settings={k:v for k,v in cfg.items() if k not in ['_root','output_directory']}
-    fingerprint=sha(json.dumps({'config':settings,
+    # Worker limits can change on resume; all prompt/protocol settings stay frozen.
+    settings={k:v for k,v in cfg.items() if k not in ['_root','output_directory','parallel_models','lmstudio_parallel_models']}
+    scheduler='problem-first-v1'
+    fingerprint=sha(json.dumps({'scheduler':scheduler,'config':settings,
         'prompts':{p['slug']:sha((Path(cfg['_root'])/p['statement']).read_text(encoding='utf-8')) for p in cfg['problems']}},sort_keys=True))
     if manifest_path.exists():
         manifest=json.loads(manifest_path.read_text(encoding='utf-8'))
+        if manifest.get('scheduler')!=scheduler:
+            raise HarnessError('Existing contest uses the previous round order. Use a new output_directory for problem-first scheduling.')
         if manifest['config_fingerprint']!=fingerprint:
             raise HarnessError('Configuration changed for this contest (settings or prompts). Use a new output_directory.')
     else:
-        manifest={'config_fingerprint':fingerprint,'created_at':now(),'metadata_fingerprints':{},'jobs':[]}
+        manifest={'scheduler':scheduler,'config_fingerprint':fingerprint,'created_at':now(),'metadata_fingerprints':{},'jobs':[]}
     for key,value in metadata.items():
         name='/'.join(key);digest=sha(json.dumps(value,sort_keys=True))
         if name in manifest['metadata_fingerprints'] and manifest['metadata_fingerprints'][name]!=digest:
             raise HarnessError('Configuration changed: judge metadata differs. Use a new output_directory.')
         manifest['metadata_fingerprints'][name]=digest
     atomic_json(manifest_path,manifest)
-    for repeat in repetitions:
+    lock=threading.Lock();stop_event=threading.Event()
+    workers=min(cfg.get('parallel_models',1),len(models))
+    local_limit=cfg.get('lmstudio_parallel_models',1)
+    execution={'started_at':now(),'parallel_models':workers,'lmstudio_parallel_models':local_limit,
+               'models':[m['label'] for m in models],'repetitions':repetitions}
+    manifest.setdefault('executions',[]).append(execution)
+    manifest.setdefault('model_status',{})
+    for model in models:manifest['model_status'][model['label']]={'status':'QUEUED','updated_at':now()}
+    atomic_json(manifest_path,manifest)
+    gates={};model_gates={}
+    def server_key(model):
+        base=(cfg.get('lmstudio_management_api','http://localhost:1234/api/v1') if cfg.get('auto_load_models',False)
+              else model.get('api_base') or cfg.get('lmstudio_api','http://localhost:1234/v1'))
+        url=urlsplit(base);return (url.scheme,url.netloc)
+    for model in models:
+        if provider_name(model)=='lmstudio':
+            key=server_key(model);gates.setdefault(key,threading.BoundedSemaphore(local_limit))
+            model_gates.setdefault((key,model['identifier']),threading.Lock())
+    def record_job(model,problem,repeat):
+        with lock:
+            if not any(j['model']==model['label'] and j['problem']==problem['slug'] and j['repeat']==repeat for j in manifest['jobs']):
+                manifest['jobs'].append({'model':model['label'],'repeat':repeat,'problem':problem['slug'],'selected_at':now()})
+                atomic_json(manifest_path,manifest)
+    def set_status(model,status,error=None):
+        with lock:
+            manifest['model_status'][model['label']]={'status':status,'updated_at':now()}
+            if error is not None:manifest['model_status'][model['label']]['error']=str(error)
+            atomic_json(manifest_path,manifest)
+    def work(model):
+        label=model['label'];set_status(model,'RUNNING')
+        try:
+            candidates=[p for p in problems if not is_solved(cfg,model,p) and
+                        any((read_job(cfg,model,p,n) or {}).get('status')!='EXHAUSTED' for n in repetitions)]
+            if candidates:
+                local=provider_name(model)=='lmstudio';key=server_key(model) if local else None
+                slot=resource_slot(gates[key],stop_event) if local else nullcontext()
+                own_slot=resource_slot(model_gates[(key,model['identifier'])],stop_event) if local else nullcontext()
+                with own_slot,slot,model_session(cfg,model) as lm:
+                    while candidates:
+                        check_cancelled(stop_event)
+                        pending=[p for p in candidates if any((read_job(cfg,model,p,n) or {}).get('status') not in (None,'ACCEPTED','EXHAUSTED') for n in repetitions)]
+                        with lock:
+                            scheduled=[j for j in manifest['jobs'] if j['model']==label and any(p['slug']==j['problem'] for p in candidates)]
+                            index=1+len({j['problem'] for j in manifest['jobs'] if j['model']==label})
+                        if pending:problem=pending[0]
+                        elif scheduled:problem=next(p for p in candidates if p['slug']==scheduled[0]['problem'])
+                        else:problem=select_problem(cfg,model,candidates,repetitions[0],lm,out/label/'selections',index,stop_event)
+                        first_round=next(n for n in repetitions if (read_job(cfg,model,problem,n) or {}).get('status')!='EXHAUSTED')
+                        record_job(model,problem,first_round)
+                        print(f'{label} chose {problem["slug"]}; completing its rounds before the next problem.',flush=True)
+                        for repeat in repetitions:
+                            check_cancelled(stop_event)
+                            if is_solved(cfg,model,problem):break
+                            if (read_job(cfg,model,problem,repeat) or {}).get('status')=='EXHAUSTED':continue
+                            record_job(model,problem,repeat)
+                            print(f'{label} / {problem["slug"]}: round {repeat}/{cfg.get("repetitions",2)}.',flush=True)
+                            run_job(cfg,model,problem,repeat,clients[label],lm,metadata[(label,problem['slug'])],stop_event)
+                        candidates=[p for p in candidates if p['slug']!=problem['slug']]
+        except BaseException as exc:
+            set_status(model,'INTERRUPTED' if stop_event.is_set() else 'FAILED',exc);raise
+        else:set_status(model,'COMPLETED')
+    errors={};futures={};pool=ThreadPoolExecutor(max_workers=workers,thread_name_prefix='contest-model')
+    print(f'Running {len(models)} models with {workers} worker(s); local concurrency per server: {local_limit}.',flush=True)
+    try:
+        for model in models:futures[pool.submit(work,model)]=model
+        for future in as_completed(futures):
+            model=futures[future]
+            try:future.result()
+            except (HarnessError,ValueError,OSError) as exc:
+                errors[model['label']]=exc
+                print(f'{model["label"]} stopped: {exc}',file=sys.stderr,flush=True)
+    except BaseException:
+        stop_event.set();raise
+    finally:
+        # Join before exporting so no worker can race with state/CSV reads.
+        pool.shutdown(wait=True,cancel_futures=True)
+        for future,model in futures.items():
+            if future.cancelled():set_status(model,'INTERRUPTED')
         for model in models:
-            candidates=[p for p in problems if not is_solved(cfg,model,p)
-                        and (read_job(cfg,model,p,repeat) or {}).get('status')!='EXHAUSTED']
-            if not candidates:continue
-            print(f'Round {repeat}/{cfg.get("repetitions",2)}: {model["label"]}, {len(candidates)} unsolved problems.',flush=True)
-            with model_session(cfg,model) as lm:
-                while candidates:
-                    # Resume a persisted job before asking the model to choose again.
-                    pending=[p for p in candidates if read_job(cfg,model,p,repeat)]
-                    scheduled=[j for j in manifest['jobs'] if j['model']==model['label'] and j['repeat']==repeat
-                               and any(p['slug']==j['problem'] for p in candidates)]
-                    if pending:problem=pending[0]
-                    elif scheduled:problem=next(p for p in candidates if p['slug']==scheduled[0]['problem'])
-                    else:
-                        folder=out/model['label']/f'round-{repeat:02d}'
-                        index=1+sum(j['model']==model['label'] and j['repeat']==repeat for j in manifest['jobs'])
-                        problem=select_problem(cfg,model,candidates,repeat,lm,folder,index)
-                        manifest['jobs'].append({'model':model['label'],'repeat':repeat,'problem':problem['slug'],'selected_at':now()})
-                        atomic_json(manifest_path,manifest)
-                    print(f'{model["label"]} chose {problem["slug"]} in round {repeat}.',flush=True)
-                    run_job(cfg,model,problem,repeat,clients[model['label']],lm,metadata[(model['label'],problem['slug'])])
-                    candidates=[p for p in candidates if p['slug']!=problem['slug']]
-    manifest['updated_at']=now();atomic_json(manifest_path,manifest)
+            if manifest['model_status'][model['label']]['status']=='QUEUED':set_status(model,'INTERRUPTED')
+        with lock:
+            execution.update(finished_at=now(),interrupted=stop_event.is_set(),failed_models=list(errors))
+            manifest['updated_at']=now();atomic_json(manifest_path,manifest)
+    if errors:
+        if len(models)==1:raise errors[models[0]['label']]
+        raise HarnessError('Some models stopped; other models finished independently. '+
+                           ' | '.join(f'{m["label"]}: {errors[m["label"]]}' for m in models if m['label'] in errors))
 
 def export(cfg):
     out=Path(cfg['_root'])/cfg.get('output_directory','results');out.mkdir(parents=True,exist_ok=True)
@@ -497,11 +582,15 @@ def main(argv=None):
     probe.add_argument('--model',required=True)
     run=sub.add_parser('run');run.add_argument('--model',help='One model label; omitted runs all enabled models')
     run.add_argument('--problem');run.add_argument('--repeat',type=int)
+    run.add_argument('--parallel-models',type=int,help='Override the number of concurrent model workers (1-32)')
     smoke=sub.add_parser('submit-file');smoke.add_argument('--model',default='qwen');smoke.add_argument('--problem',required=True);smoke.add_argument('--file',required=True)
     sub.add_parser('export')
     attach=sub.add_parser('attach-submission');attach.add_argument('--state',required=True);attach.add_argument('--submission-id',required=True)
     attach.add_argument('--source-file',required=True,help='Source downloaded from that submission in the DOMjudge jury UI')
     args=ap.parse_args(argv);cfg=load_config(args.config)
+    if args.command=='run' and args.parallel_models is not None:
+        if not 1<=args.parallel_models<=32:raise HarnessError('parallel_models must be between 1 and 32.')
+        cfg['parallel_models']=args.parallel_models
     if args.command=='export':export(cfg);return
     if args.command=='doctor':doctor(cfg,args.model);return
     if args.command=='probe-model':probe_model(cfg,args.model);return

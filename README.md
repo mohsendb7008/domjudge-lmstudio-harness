@@ -12,7 +12,7 @@ The supplied source archive has no official numeric per-problem time limit. DOMj
 
 ## 2. Install and load a model
 
-Start with **Qwen2.5-Coder-7B-Instruct, GGUF Q4_K_M**, subject to available memory. For a second family, try **Gemma 3 4B IT, GGUF Q4_K_M**. They differ in size: this initial comparison is of practical local configurations, rather than equal-sized architectures. Start LM Studio's local server on port **1234**. Load a model manually for `doctor` to list its ID; unload it before starting the automatic batch. The default automatic load requests a 32768-token context to accommodate selecting among all public statements and multi-attempt conversations. Adjust `context_length` and `max_tokens` to your model and available memory. Download each local model before the batch; automatic loading does not download models.
+Start with **Qwen2.5-Coder-7B-Instruct, GGUF Q4_K_M**, subject to available memory. For a second family, try **Gemma 3 4B IT, GGUF Q4_K_M**. They differ in size: this initial comparison is of practical local configurations, rather than equal-sized architectures. Start LM Studio's local server on port **1234**. The supplied config uses manual loading: keep Qwen and Gemma loaded before running both. Its model `context_length` values are 32768, but with `auto_load_models: false` you must configure the actual context size in LM Studio. If you switch to automatic loading, the runner passes that value to the native loader. Adjust `context_length` and `max_tokens` to your model and available memory. Download each local model before the batch; automatic loading does not download models.
 
 ## 3. Configure and check the connection
 
@@ -47,27 +47,33 @@ python harness.py run --model qwen --problem arithmeticadaptation --repeat 1
 
 ## 4. Run an unattended contest
 
-After checking imports and references, configure each model you want to run: set `enabled` to `true`, its exact `identifier`, and its DOMjudge team. Qwen is enabled by default; Gemma and the two cloud examples are disabled until configured. Set all enabled teams' password environment variables before starting so the batch needs no later prompts. For a single-model pilot, `--model LABEL` explicitly selects that model even if disabled.
+After checking imports and references, configure each model you want to run: set `enabled` to `true`, its exact `identifier`, and its DOMjudge team. The supplied config enables Qwen (`qwen2.5-coder-7b-instruct`) and Gemma (`gemma-3-4b-it`); the cloud examples remain disabled. Set all enabled teams' password environment variables before starting so the batch needs no later prompts. For a single-model pilot, `--model LABEL` explicitly selects that model even if disabled.
 
 ```text
 python harness.py run
 ```
 
-This command runs all enabled models in configuration order through **two rounds**, with **up to 10 attempts per problem per round**. In round 1, one model takes its turn across the problem set: it chooses an unsolved problem, finishes its attempts for that problem (stopping immediately on AC), then chooses another. Once every model has finished round 1, round 2 revisits only each model's unsolved problems. A problem solved by one model remains available to the other models. Exhausted problems are removed from the current round's candidate pool, preventing endless reselection. Completion means every problem is accepted or has exhausted both budgets; acceptance of every problem is not guaranteed.
+The supplied config runs Qwen and Gemma concurrently, with **three rounds and up to three attempts per problem per round**. Each model chooses a problem and completes round 1, then round 2, then round 3 before choosing another problem. Acceptance immediately skips all remaining attempts and rounds for that model/problem. A problem solved by one model remains available to other models. Completion means every problem is accepted or has exhausted all configured rounds; acceptance of every problem is not guaranteed. `repetitions` supports 1-100 rounds, and `attempts` supports 1-10 attempts per round.
 
-Each problem/round starts a fresh conversation. Failed attempts within that conversation receive the statement, latest response, and latest DOMjudge verdict. The full conversation audit remains on disk, while inference sends only the latest repair exchange to avoid accumulating ten large solutions in the context window. The requested local seed varies by round; seeds do not guarantee reproducibility across backends or hardware. Generation and judging are sequential. Runtime depends on model speed, response budgets, retries, and the judge queue; no fixed few-hour completion time is guaranteed.
+Each problem/round starts a fresh conversation. Failed attempts within that conversation receive the statement, latest response, and latest DOMjudge verdict. The full conversation audit remains on disk, while inference sends only the latest repair exchange to avoid accumulating ten large solutions in the context window. The requested local seed varies by round; seeds do not guarantee reproducibility across backends or hardware. Generation, submission, and verdict feedback stay sequential within each model; different model workers overlap. Runtime depends on model speed, response budgets, retries, and the judge queue; no fixed few-hour completion time is guaranteed.
+
+`parallel_models` limits concurrent model workers; `lmstudio_parallel_models` limits simultaneous local model sessions per LM Studio server. Both are `2` in the supplied config. Cloud workers can overlap local work. Set either limit to `1` to reduce memory pressure; models sharing the exact same local instance are serialized even if the limit is higher. You can override the overall limit with `python harness.py run --parallel-models 1`. Credentials are collected and judge IDs validated in the main thread before workers start. A provider/judging failure stops that model, lets other models finish, exports all saved results, and exits with an error; rerunning resumes the failed model's existing problem/round.
+
+For two local models on one server, load both with enough RAM/VRAM for their actual context sizes. If using JIT loading, turn off **Only Keep Last JIT Loaded Model / Auto-Evict**, which otherwise retains only one JIT-loaded model. LM Studio may still queue requests or share GPU resources, so overlapping requests do not guarantee a speedup. See [LM Studio Auto-Evict documentation](https://lmstudio.ai/docs/developer/core/ttl-and-auto-evict).
+
+Ctrl+C asks workers to stop at safe boundaries. An in-flight HTTP request can take up to its configured timeout to return; submission IDs and source are saved before workers exit, and exports are written only after all workers have stopped. Pending or uncertain submissions keep the same recovery rules below.
 
 Choose the selection policy in `config.json`:
 
 | `problem_selection` | Behavior |
 | --- | --- |
-| `model` (default) | The active model reads the remaining public statements and chooses the easiest problem for itself. This adds one inference request per chosen problem, outside the solution-attempt budget. |
-| `easiest` | Choose the lowest numeric per-problem `difficulty`, without a selector inference. Unknown difficulty sorts last; ties use configuration order. |
+| `model` | The active model reads the remaining public statements and chooses the easiest problem for itself. This adds one inference request per chosen problem, outside the solution-attempt budget. |
+| `easiest` (supplied config) | Choose the lowest numeric per-problem `difficulty`, without a selector inference. Unknown difficulty sorts last; ties use configuration order. |
 | `configured` | Choose the first remaining problem in configuration order. |
 
-Difficulty defaults to `null`; no official difficulty ranking is supplied. An invalid or truncated model selection falls back to configured difficulty/order. Selection requests receive only slugs, names, difficulty, and public statement text. Hints, reference code, hidden tests, and judge import metadata are excluded. Ensure the selector's context fits all statements; use `easiest` or `configured` to avoid that context cost. Increase `selection_max_tokens` for models that spend output tokens on reasoning.
+The supplied numeric difficulty order is your chosen heuristic, not an official ranking. Missing difficulty defaults to `null`. An invalid or truncated model selection falls back to configured difficulty/order. Selection requests receive only slugs, names, difficulty, and public statement text. Hints, reference code, hidden tests, and judge import metadata are excluded. Ensure the selector's context fits all statements; use `easiest` or `configured` to avoid that context cost. Increase `selection_max_tokens` for models that spend output tokens on reasoning.
 
-### Round-two hidden hints
+### Hints from round two onward
 
 The starter config now includes a one-paragraph algorithm hint for each of the 11 NCPC 2025 problems under `hidden_hints`. Read [NCPC_2025_HINTS.md](NCPC_2025_HINTS.md) for the approaches, pitfalls, and C++17 language advice. These are strong outlines checked against the supplied public statements and reference approaches. Use a new `output_directory` to enable or change them after a contest has started; clearing the mapping and per-problem hints disables hint assistance.
 
@@ -79,7 +85,7 @@ Customize a problem's `hidden_hint` in `config.json`, or edit the top-level mapp
 }
 ```
 
-A nonempty per-problem hint takes precedence over the mapping. The hint is appended to the solving prompt **only in round 2**. It never enters round-1 solving prompts or any problem-selection prompt. Empty hints are allowed. Round 2 starts fresh with the statement and hint, without round-1 conversation history. The supplied hints describe public algorithmic approaches, not hidden judge tests. Round-two request/state files contain the hint once it has been used; “hidden” refers to withholding it from earlier model prompts, not encryption of configuration or result files.
+A nonempty per-problem hint takes precedence over the mapping. The hint is appended to the solving prompt **in round 2 and every later round**. It never enters round-1 solving prompts or any problem-selection prompt. Empty hints are allowed. Each hinted round starts fresh with the statement and hint, without previous-round conversation history. The supplied hints describe public algorithmic approaches, not hidden judge tests. Hinted-round request/state files contain the hint once it has been used; “hidden” refers to withholding it from earlier model prompts, not encryption of configuration or result files.
 
 ### Providers and API keys
 
@@ -93,7 +99,7 @@ The sample config includes disabled `openai` and `claude` entries. Replace their
 
 LM Studio uses its OpenAI-compatible Chat Completions endpoint, OpenAI uses Chat Completions with `max_completion_tokens`, and Claude uses its native Messages endpoint. Global `temperature`, `top_p`, and `seed` apply to LM Studio. Cloud defaults omit these parameters because support depends on the chosen model. Optional per-model cloud settings include `temperature`/`top_p` where supported; OpenAI supports `reasoning_effort`, and Claude supports `thinking`/`output_config`. Record and verify settings for your selected model; reasoning may consume the output budget. For Claude with an explicit thinking budget, selector output budgets are raised when needed to leave room beyond the thinking tokens. Cloud keys are checked before the batch; model availability is validated by the provider on inference.
 
-`auto_load_models: true` loads each active local model through LM Studio's native `/api/v1/models/load`, uses its returned instance ID for inference, and unloads it after that model's round, including ordinary failure/interrupt cleanup. This requires an LM Studio server supporting the native v1 management API. Configure `lmstudio_management_api` separately if the server is remote. Start with other manually loaded models unloaded so they do not consume the batch's memory budget. For older servers or manual loading, set `auto_load_models` to `false`; each requested model must then be available through `/v1/models`.
+`auto_load_models: true` loads each active local model through LM Studio's native `/api/v1/models/load`, uses its returned instance ID for inference, and unloads it after that model's entire problem sequence, including ordinary failure/interrupt cleanup. This requires an LM Studio server supporting the native v1 management API. Configure `lmstudio_management_api` separately if the server is remote. Start with other manually loaded models unloaded so they do not consume the batch's memory budget. For older servers or manual loading, set `auto_load_models` to `false`; each requested model must then be available through `/v1/models`.
 
 Transient inference errors (rate limiting, temporary server errors, and connection failures) use bounded retries with exponential backoff. `generation_retries` defaults to 3. Retry calls do not consume extra solution attempts, though a provider might charge a generation whose response was lost. DOMjudge submissions are never blindly retried after an ambiguous outcome.
 
@@ -105,11 +111,11 @@ python harness.py run --model qwen
 python harness.py run --model claude --repeat 1
 ```
 
-`--repeat 2` requires finished round-1 runs for the selected model/problems. Omit `--repeat` to run both rounds automatically. Settings, hints, prompts, and judge metadata are frozen once a contest starts; use a new output directory to change them. The new default `results-contest` keeps old independent-repetition experiment results separate.
+`--repeat N` runs only that round and requires all earlier rounds of the selected unsolved problems to be finished. Omit `--repeat` to complete all rounds of one problem before moving on. Settings, hints, prompts, and judge metadata are frozen once a contest starts; use a new output directory to change them. The two worker-limit settings can be adjusted on resume and are recorded in `contest.json` under `executions`. Older `contest.json` files used round-first scheduling and require a fresh `output_directory`; the runner does not mix those results with this schedule. The supplied directory is `results-contest2`; if it already contains a legacy contest, use a new name such as `results-contest3`.
 
 ## 5. Results and interpretation
 
-`results-contest/` (or your configured output directory) contains raw generation requests/responses, generated source, submission IDs, final judgement objects and resumable state. The exports are:
+`results-contest2/` (or your configured output directory) contains raw generation requests/responses, generated source, submission IDs, final judgement objects and resumable state. The exports are:
 
 | File | Contents |
 | --- | --- |
@@ -117,15 +123,15 @@ python harness.py run --model claude --repeat 1
 | `runs.csv` | Completion status, first-attempt acceptance, final acceptance, attempts used and summed generation duration |
 | `summary.json` | Maximum possible/started/completed run counts and descriptive run-level acceptance rates by model |
 | `scoreboard.json` | Unique solved problems per model, solves without hints, remaining/exhausted problems, and contest completion |
-| `contest.json` | Persisted problem selections and configuration fingerprints for resume |
+| `contest.json` | Persisted problem/round order, model completion/errors, configuration fingerprints, and worker limits for each execution |
 
 Exports refresh when a run command exits, including ordinary errors and Ctrl+C. Export existing states at any time with `python harness.py export`. Incomplete runs remain explicitly incomplete; they are not reported as completed failures. Format errors and truncated responses consume an attempt without submitting code.
 
-Use `scoreboard.json` for contest-level solved counts. `configured_runs` is an upper bound: accepted problems skip round 2, so a finished contest can have fewer completed runs. Run-level rates are descriptive and depend on which unsolved problems reach round 2; compare unique solved problems and unassisted solves across models. First-attempt acceptance, acceptance within 10 attempts, and hinted-round acceptance are different metrics. Verdict feedback makes these attempts dependent; this is not an independent-sample pass@10 estimate. Successful-run generation duration can favor models that solve only easier problems: compare shared solved problems too.
+Use `scoreboard.json` for contest-level solved counts. `configured_runs` is an upper bound: accepted problems skip later rounds, so a finished contest can have fewer completed runs. Run-level rates are descriptive and depend on which unsolved problems reach round 2; compare unique solved problems and unassisted solves across models. First-attempt acceptance, acceptance within the configured attempt budget, and hinted-round acceptance are different metrics. Verdict feedback makes these attempts dependent; this is not an independent-sample pass@10 estimate. Successful-run generation duration can favor models that solve only easier problems: compare shared solved problems too.
 
-Generation duration is measured client-side and includes server overhead. Token counts are whatever the provider returns; Claude input/output counts are normalized for CSV exports. Selector calls are stored under each model's `round-NN` folder and excluded from solution-attempt counts and generation-duration aggregates. Polling wait includes queueing and network/poll delays; it is not solution execution time. DOMjudge 9's `max_run_time` is the maximum runtime among runs responsible for the final verdict; the export names this `judge_max_runtime_for_verdict_s`. This team API runner does not collect peak memory or compiler diagnostics: memory cells remain empty, and feedback is verdict-only. No experiment numbers have been generated on your actual installation yet.
+Generation duration is measured client-side and includes server overhead. Token counts are whatever the provider returns; Claude input/output counts are normalized for CSV exports. Selector calls are stored under each model's `selections` folder and excluded from solution-attempt counts and generation-duration aggregates. Polling wait includes queueing and network/poll delays; it is not solution execution time. DOMjudge 9's `max_run_time` is the maximum runtime among runs responsible for the final verdict; the export names this `judge_max_runtime_for_verdict_s`. This team API runner does not collect peak memory or compiler diagnostics: memory cells remain empty, and feedback is verdict-only. No experiment numbers have been generated on your actual installation yet.
 
-The prompt files contain original LaTeX statement text and public samples. Illustrations are omitted. This is a **text-only NCPC evaluation**; review any illustration-dependent problem before deciding which problems to include. Difficulty labels are not supplied. Hidden tests and accepted references never enter model prompts. User-authored hints enter only round-two solving prompts. `reference_solutions/` and the import archives are for judge calibration only. DOMjudge executes generated solutions; the harness does not execute them on the host.
+The prompt files contain original LaTeX statement text and public samples. Illustrations are omitted. This is a **text-only NCPC evaluation**; review any illustration-dependent problem before deciding which problems to include. Difficulty numbers in config are your heuristic ordering. Hidden tests and accepted references never enter model prompts. Algorithm hints enter solving prompts only from round 2 onward. `reference_solutions/` and the import archives are for judge calibration only. DOMjudge executes generated solutions; the harness does not execute them on the host.
 
 ## 6. Resume and troubleshoot
 
@@ -157,7 +163,7 @@ If the process loses contact **during submission**, the state may be `SUBMITTING
 python harness.py attach-submission --state results-contest/qwen/arithmeticadaptation/repeat-01/state.json --submission-id THE_ID --source-file downloaded-main.cpp
 ```
 
-This checks team/problem/language metadata and compares the supplied downloaded source with the saved attempt. The standard team API does not permit fetching submission source automatically. Select the correct submission in the UI before attaching, then rerun `run`. Use the configured output directory in the state path (the new default is `results-contest`).
+This checks team/problem/language metadata and compares the supplied downloaded source with the saved attempt. The standard team API does not permit fetching submission source automatically. Select the correct submission in the UI before attaching, then rerun `run`. Use the configured output directory in the state path (the supplied config uses `results-contest2`).
 
 If you have confirmed in DOMjudge that **no submission was created**, back up that `state.json`, change only the latest attempt's `status` from `SUBMITTING` to `GENERATED`, and rerun. Never do this while the original submission could still be processing.
 

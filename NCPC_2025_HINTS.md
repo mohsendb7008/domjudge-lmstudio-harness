@@ -1,6 +1,6 @@
-# NCPC 2025: second-round algorithm hints
+# NCPC 2025: algorithm hints from round two onward
 
-These paragraphs are written for the harness's C++17 submissions and are copied into `config.json` under `hidden_hints`. The runner appends only the selected problem's hint to its round-two solving prompt. Round-one solving and problem selection remain unhinted. Choose a new `output_directory` when enabling these hints for an experiment that has already started, because hints are part of the frozen configuration. A nonempty per-problem `hidden_hint` overrides the corresponding top-level hint.
+These paragraphs are written for the harness's C++17 submissions and are copied into `config.json` under `hidden_hints`. The runner appends only the selected problem's hint to its solving prompts from round two onward. Round-one solving and problem selection remain unhinted. Choose a new `output_directory` when enabling these hints for an experiment that has already started, because hints are part of the frozen configuration. A nonempty per-problem `hidden_hint` overrides the corresponding top-level hint.
 
 The algorithm descriptions were checked against the supplied public problem statements and reference solutions; the Dune Dash endpoint construction and Hidden Permutation divisor inversion are equivalent approaches derived from the problem structure. These are strong solution-outline hints, not guarantees that a model will produce an accepted program. No hidden test cases or reference source code are placed in the prompts. The [official contest page](https://nordic.icpc.io/ncpc2025/compete) links the statements, solution slides, and judges' solutions.
 
