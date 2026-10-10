@@ -13,11 +13,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from providers import (PROVIDERS, provider_name, generation_payload,
-                       response_content, generation_call)
+                       response_content, generation_call, generation_path)
 
 class HarnessError(Exception): pass
 class ApiError(HarnessError):
-    def __init__(self,message,status=None):super().__init__(message);self.status=status
+    def __init__(self,message,status=None,error_code=None):
+        super().__init__(message);self.status=status;self.error_code=error_code
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def atomic_json(path,data):
@@ -27,12 +28,30 @@ def atomic_json(path,data):
 def sha(value):return hashlib.sha256(value.encode()).hexdigest()
 
 class Client:
-    def __init__(self,base,username=None,password=None,key=None,timeout=60):
+    def __init__(self,base,username=None,password=None,key=None,timeout=60,inference=False):
         self.base=base.rstrip('/');self.timeout=timeout;self.headers={'Accept':'application/json'}
+        self.inference=inference
+        self.secrets=[value for value in (username,password,key) if value]
         if username is not None:
             token=base64.b64encode(f'{username}:{password}'.encode()).decode()
             self.headers['Authorization']='Basic '+token
         if key:self.headers['Authorization']='Bearer '+key
+    def error_detail(self,raw):
+        # Extract only structured error fields, never an entire body or judge response.
+        try:body=json.loads(raw)
+        except (ValueError,UnicodeDecodeError):return '',None
+        if not isinstance(body,dict):return '',None
+        error=body.get('error',body)
+        message=error if isinstance(error,str) else error.get('message','') if isinstance(error,dict) else ''
+        code=error.get('code') if isinstance(error,dict) else None
+        if not isinstance(code,str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}',code):code=None
+        if not isinstance(message,str):message=''
+        detail=(('['+code+'] ') if code else '')+message
+        secrets=self.secrets+[v for k,v in self.headers.items() if k.lower() in ('authorization','x-api-key')]
+        for secret in sorted(secrets,key=len,reverse=True):detail=detail.replace(secret,'[REDACTED]')
+        detail=re.sub(r'\bsk-[A-Za-z0-9_-]+','[REDACTED]',detail)
+        detail=re.sub(r'\b(Bearer|Basic)\s+\S+',r'\1 [REDACTED]',detail,flags=re.I)
+        return ' '.join(detail.split())[:800],code
     def call(self,method,path,payload=None,query=None):
         url=self.base+'/'+path.lstrip('/')
         if query:url+='?'+urlencode(query)
@@ -44,8 +63,14 @@ class Client:
             with urlopen(req,timeout=self.timeout) as response:
                 raw=response.read()
         except HTTPError as exc:
-            # No credentials or raw server bodies enter console/error logs.
-            raise ApiError(f'{method} {path}: HTTP {exc.code}. Check API credentials, IDs, and service configuration.',exc.code) from None
+            detail,code='',None
+            try:
+                if self.inference:detail,code=self.error_detail(exc.read(65536))
+            except OSError:pass
+            finally:exc.close()
+            message=f'{method} {path}: HTTP {exc.code}. '
+            message+=detail or 'Check API credentials, IDs, and service configuration.'
+            raise ApiError(message,exc.code,code) from None
         except (URLError,TimeoutError,OSError):
             raise ApiError(f'{method} {path}: connection failed or timed out.') from None
         try:return json.loads(raw)
@@ -62,7 +87,7 @@ def dom_client(config,model,interactive=True):
         if not interactive or not sys.stdin.isatty():raise HarnessError('Set DOMJUDGE_PASSWORD, or run in a terminal to enter it privately.')
         pwd=getpass.getpass(f'DOMjudge password for {user}: ')
     return Client(config['domjudge_api'],user,pwd,timeout=config.get('api_timeout_s',60))
-def lm_client(config):return Client(config['lmstudio_api'],key=os.environ.get('LMSTUDIO_API_KEY'),timeout=config.get('generation_timeout_s',600))
+def lm_client(config):return Client(config['lmstudio_api'],key=os.environ.get('LMSTUDIO_API_KEY'),timeout=config.get('generation_timeout_s',600),inference=True)
 
 def model_client(cfg,model):
     provider=provider_name(model)
@@ -73,7 +98,7 @@ def model_client(cfg,model):
     key=os.environ.get(model.get('api_key_env') or env)
     if provider!='lmstudio' and not key:raise HarnessError('Set '+(model.get('api_key_env') or env)+' before running '+model['label']+'.')
     client=Client(model.get('api_base') or cfg.get(setting,base),key=key if provider!='anthropic' else None,
-                  timeout=cfg.get('generation_timeout_s',600))
+                  timeout=cfg.get('generation_timeout_s',600),inference=True)
     if provider=='anthropic':client.headers.update({'x-api-key':key,'anthropic-version':'2023-06-01'})
     return client
 
@@ -84,7 +109,7 @@ def model_session(cfg,model):
         if cfg.get('auto_load_models',False):
             native=Client(cfg.get('lmstudio_management_api','http://localhost:1234/api/v1'),
                           key=os.environ.get(model.get('api_key_env') or 'LMSTUDIO_API_KEY'),
-                          timeout=cfg.get('generation_timeout_s',600))
+                          timeout=cfg.get('generation_timeout_s',600),inference=True)
             payload={'model':model['identifier']}
             if model.get('context_length'):payload['context_length']=model['context_length']
             result=native.call('POST','models/load',payload)
@@ -123,6 +148,9 @@ def load_config(path):
         if provider_name(model) not in PROVIDERS:raise HarnessError('Unknown provider for '+model['label'])
         if 'enabled' in model and type(model['enabled'])!=bool:raise HarnessError('enabled must be true or false.')
         if 'api_key' in model:raise HarnessError('Use api_key_env; never put API keys in config.')
+        for field in ('api_key_env','username_env','password_env'):
+            if field in model and (not isinstance(model[field],str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',model[field])):
+                raise HarnessError(field+' must name an environment variable, not contain a credential.')
         if model.get('api_base') and urlsplit(model['api_base']).scheme not in ['http','https']:
             raise HarnessError('api_base must be an HTTP(S) URL.')
     if not isinstance(cfg.get('hidden_hints',{}),dict):raise HarnessError('hidden_hints must map problem slugs to hint text.')
@@ -321,7 +349,10 @@ def select_problem(cfg,model,problems,repeat,lm,folder,index):
     payload=generation_payload(cfg,model,[{'role':'user','content':instruction+json.dumps(public,ensure_ascii=False)}],
                                repeat,getattr(lm,'model_id',None),selection=True)
     atomic_json(folder/f'selection-{index:03d}-request.json',payload)
-    response=generation_call(lm,model,payload,cfg,ApiError)
+    print(f'Selecting a problem with {model["label"]}: {len(problems)} public statements.',flush=True)
+    try:response=generation_call(lm,model,payload,cfg,ApiError)
+    except ApiError as exc:
+        raise ApiError('Problem selection failed: '+str(exc),exc.status,exc.error_code) from None
     atomic_json(folder/f'selection-{index:03d}-response.json',response)
     try:
         content,_,reason=response_content(response,model)
@@ -442,10 +473,28 @@ def export(cfg):
     atomic_json(out/'scoreboard.json',scoreboard)
     print('Results exported to '+str(out))
 
+def probe_model(cfg,label):
+    model=get_model(cfg,label)
+    # A short request isolates provider/runtime failures from contest prompt size.
+    budget=256
+    thinking=model.get('thinking')
+    if provider_name(model)=='anthropic' and isinstance(thinking,dict) and thinking.get('type')=='enabled':
+        budget=max(budget,thinking.get('budget_tokens',0)+1024)
+    probe=dict(model,max_tokens=budget)
+    print(f'Probing inference for {label} ({provider_name(model)}).',flush=True)
+    with model_session(cfg,model) as client:
+        payload=generation_payload(cfg,probe,[{'role':'user','content':'Reply with OK.'}],1,getattr(client,'model_id',None))
+        response=client.call('POST',generation_path(model),payload)
+        try:response_content(response,model)
+        except (KeyError,IndexError,TypeError):raise HarnessError('Inference returned an unexpected response format.') from None
+    print('Inference request succeeded. Next, try one contest problem before the full run.',flush=True)
+
 def main(argv=None):
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--config',default='config.json')
     sub=ap.add_subparsers(dest='command',required=True)
     doctor_p=sub.add_parser('doctor');doctor_p.add_argument('--model',default='qwen')
+    probe=sub.add_parser('probe-model',help='Test inference without DOMjudge, problem statements, or saved contest state')
+    probe.add_argument('--model',required=True)
     run=sub.add_parser('run');run.add_argument('--model',help='One model label; omitted runs all enabled models')
     run.add_argument('--problem');run.add_argument('--repeat',type=int)
     smoke=sub.add_parser('submit-file');smoke.add_argument('--model',default='qwen');smoke.add_argument('--problem',required=True);smoke.add_argument('--file',required=True)
@@ -455,6 +504,7 @@ def main(argv=None):
     args=ap.parse_args(argv);cfg=load_config(args.config)
     if args.command=='export':export(cfg);return
     if args.command=='doctor':doctor(cfg,args.model);return
+    if args.command=='probe-model':probe_model(cfg,args.model);return
     require_ids(cfg)
     if args.command=='attach-submission':
         f=Path(args.state);s=json.loads(f.read_text(encoding='utf-8'));a=s['attempts'][-1]
