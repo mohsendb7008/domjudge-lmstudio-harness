@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Small DOMjudge 9 + LM Studio runner. Python 3.10+, standard library only.
+"""Resumable DOMjudge open contest runner. Python 3.10+, standard library only.
 
 No generated program is executed by this process; DOMjudge handles judging.
 The default protocol returns verdicts only, never secret test data.
 """
 import argparse, base64, csv, getpass, hashlib, io, json, os, re, statistics
 import sys, time, zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
+from providers import (PROVIDERS, provider_name, generation_payload,
+                       response_content, generation_call)
 
 class HarnessError(Exception): pass
 class ApiError(HarnessError):
@@ -42,7 +45,7 @@ class Client:
                 raw=response.read()
         except HTTPError as exc:
             # No credentials or raw server bodies enter console/error logs.
-            raise ApiError(f'{method} {path}: HTTP {exc.code}. Check credentials, IDs, contest window, and API base.',exc.code) from None
+            raise ApiError(f'{method} {path}: HTTP {exc.code}. Check API credentials, IDs, and service configuration.',exc.code) from None
         except (URLError,TimeoutError,OSError):
             raise ApiError(f'{method} {path}: connection failed or timed out.') from None
         try:return json.loads(raw)
@@ -52,20 +55,84 @@ class Client:
 def identifier(value):return quote(str(value),safe='')
 def contest_path(cid,tail=''):return 'contests/'+identifier(cid)+(('/'+tail) if tail else '')
 def dom_client(config,model,interactive=True):
-    user=os.environ.get(model.get('username_env','DOMJUDGE_USER')) or model.get('username')
-    pwd=os.environ.get(model.get('password_env','DOMJUDGE_PASSWORD'))
+    user=os.environ.get(model.get('username_env') or 'DOMJUDGE_USER') or model.get('username')
+    pwd=os.environ.get(model.get('password_env') or 'DOMJUDGE_PASSWORD')
     if not user:raise HarnessError('Set a team username in config.json or DOMJUDGE_USER.')
     if pwd is None:
         if not interactive or not sys.stdin.isatty():raise HarnessError('Set DOMJUDGE_PASSWORD, or run in a terminal to enter it privately.')
         pwd=getpass.getpass(f'DOMjudge password for {user}: ')
     return Client(config['domjudge_api'],user,pwd,timeout=config.get('api_timeout_s',60))
 def lm_client(config):return Client(config['lmstudio_api'],key=os.environ.get('LMSTUDIO_API_KEY'),timeout=config.get('generation_timeout_s',600))
+
+def model_client(cfg,model):
+    provider=provider_name(model)
+    defaults={'lmstudio':('lmstudio_api','http://localhost:1234/v1','LMSTUDIO_API_KEY'),
+              'openai':('openai_api','https://api.openai.com/v1','OPENAI_API_KEY'),
+              'anthropic':('anthropic_api','https://api.anthropic.com/v1','ANTHROPIC_API_KEY')}
+    setting,base,env=defaults[provider]
+    key=os.environ.get(model.get('api_key_env') or env)
+    if provider!='lmstudio' and not key:raise HarnessError('Set '+(model.get('api_key_env') or env)+' before running '+model['label']+'.')
+    client=Client(model.get('api_base') or cfg.get(setting,base),key=key if provider!='anthropic' else None,
+                  timeout=cfg.get('generation_timeout_s',600))
+    if provider=='anthropic':client.headers.update({'x-api-key':key,'anthropic-version':'2023-06-01'})
+    return client
+
+@contextmanager
+def model_session(cfg,model):
+    client=model_client(cfg,model);native=None;instance=None
+    if provider_name(model)=='lmstudio':
+        if cfg.get('auto_load_models',False):
+            native=Client(cfg.get('lmstudio_management_api','http://localhost:1234/api/v1'),
+                          key=os.environ.get(model.get('api_key_env') or 'LMSTUDIO_API_KEY'),
+                          timeout=cfg.get('generation_timeout_s',600))
+            payload={'model':model['identifier']}
+            if model.get('context_length'):payload['context_length']=model['context_length']
+            result=native.call('POST','models/load',payload)
+            instance=result.get('instance_id')
+            if not instance:raise HarnessError('LM Studio load response has no instance_id.')
+            client.model_id=instance
+        else:
+            visible=client.call('GET','models').get('data',[])
+            if not any(m.get('id')==model['identifier'] for m in visible):
+                raise HarnessError('Configured model ID is not visible in LM Studio; load it or enable auto_load_models.')
+    try:yield client
+    finally:
+        if native and instance:
+            try:native.call('POST','models/unload',{'instance_id':instance})
+            except ApiError as exc:print('Could not unload LM Studio model: '+str(exc),file=sys.stderr)
+
 def load_config(path):
     file=Path(path).resolve();cfg=json.loads(file.read_text(encoding='utf-8'));cfg['_root']=str(file.parent)
-    for k in ['domjudge_api','lmstudio_api']:
-        if urlsplit(cfg[k]).scheme not in ['http','https']:raise HarnessError(k+' must be an HTTP(S) URL.')
-    if not 1<=cfg.get('attempts',3)<=10:raise HarnessError('attempts must be between 1 and 10.')
-    if cfg.get('repetitions',1)<1:raise HarnessError('repetitions must be positive.')
+    for k in ['domjudge_api','lmstudio_api','openai_api','anthropic_api','lmstudio_management_api']:
+        if k in cfg and urlsplit(cfg[k]).scheme not in ['http','https']:raise HarnessError(k+' must be an HTTP(S) URL.')
+    if not cfg.get('domjudge_api'):raise HarnessError('Set domjudge_api.')
+    for k,default,lower,upper in [('attempts',10,1,10),('repetitions',2,1,2),('generation_retries',3,0,10)]:
+        value=cfg.get(k,default)
+        if type(value)!=int or not lower<=value<=upper:raise HarnessError(f'{k} must be an integer between {lower} and {upper}.')
+    if cfg.get('problem_selection','model') not in ['model','easiest','configured']:
+        raise HarnessError('problem_selection must be model, easiest, or configured.')
+    for collection,key in [('models','label'),('problems','slug')]:
+        seen=set()
+        for item in cfg.get(collection,[]):
+            name=item.get(key,'')
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*',name) or name in seen:
+                raise HarnessError('Invalid or duplicated '+key+': '+str(name))
+            seen.add(name)
+        if not seen:raise HarnessError('Configure at least one '+collection+' entry.')
+    for model in cfg['models']:
+        if provider_name(model) not in PROVIDERS:raise HarnessError('Unknown provider for '+model['label'])
+        if 'enabled' in model and type(model['enabled'])!=bool:raise HarnessError('enabled must be true or false.')
+        if 'api_key' in model:raise HarnessError('Use api_key_env; never put API keys in config.')
+        if model.get('api_base') and urlsplit(model['api_base']).scheme not in ['http','https']:
+            raise HarnessError('api_base must be an HTTP(S) URL.')
+    if not isinstance(cfg.get('hidden_hints',{}),dict):raise HarnessError('hidden_hints must map problem slugs to hint text.')
+    for hint in list(cfg.get('hidden_hints',{}).values())+[p.get('hidden_hint','') for p in cfg['problems']]:
+        if not isinstance(hint,str):raise HarnessError('Hidden hints must be strings.')
+    if set(cfg.get('hidden_hints',{}))-{p['slug'] for p in cfg['problems']}:
+        raise HarnessError('hidden_hints contains an unknown problem slug.')
+    for p in cfg['problems']:
+        if p.get('difficulty') is not None and (type(p['difficulty']) not in (int,float) or not 0<=p['difficulty']<float('inf')):
+            raise HarnessError('difficulty must be a nonnegative finite number; lower means easier.')
     return cfg
 def get_model(cfg,label):
     models=[m for m in cfg['models'] if m['label']==label]
@@ -84,7 +151,7 @@ def doctor(cfg,label):
         for tail in ['account','problems']:
             try:print(tail+':\n'+json.dumps(dj.call('GET',contest_path(cfg['contest_id'],tail)),indent=2))
             except ApiError as exc:print(str(exc))
-    try:print('LM Studio model IDs:\n'+json.dumps(lm_client(cfg).call('GET','models'),indent=2))
+    try:print(provider_name(model)+' model IDs:\n'+json.dumps(model_client(cfg,model).call('GET','models'),indent=2))
     except ApiError as exc:print(str(exc))
 
 def validate_problem(dj,cfg,problem):
@@ -127,7 +194,17 @@ def wait_for_judgement(dj,cfg,submission_id):
 
 def save_state(folder,state):atomic_json(folder/'state.json',state)
 def protocol_config(cfg,model,problem,prompt):
-    return {k:cfg.get(k) for k in ['domjudge_api','lmstudio_api','contest_id','language_id','attempts','repetitions','temperature','top_p','max_tokens','seed']}
+    defaults={'attempts':10,'repetitions':2}
+    return {k:cfg.get(k,defaults.get(k)) for k in ['domjudge_api','lmstudio_api','openai_api','anthropic_api','contest_id','language_id','attempts','repetitions','temperature','top_p','max_tokens','seed','problem_selection']}
+
+def hidden_hint(cfg,problem,repeat):
+    return (problem.get('hidden_hint') or cfg.get('hidden_hints',{}).get(problem['slug'],'')) if repeat==2 else ''
+
+def generation_messages(state):
+    # Keep the full audit history on disk, but send only the latest repair exchange.
+    # Ten large responses otherwise exceed the local model's context window.
+    messages=state['messages']
+    return messages if len(messages)<=3 else [messages[0],*messages[-2:]]
 
 def run_job(cfg,model,problem,repeat,dj,lm,metadata):
     root=Path(cfg['_root']);prompt=(root/problem['statement']).read_text(encoding='utf-8')
@@ -136,6 +213,8 @@ def run_job(cfg,model,problem,repeat,dj,lm,metadata):
                  'Do not access files or a network. The statement uses LaTeX notation.\n\n')
     limits=metadata['problem']
     initial=instruction+'DOMjudge problem configuration:\n'+json.dumps({k:limits[k] for k in ['time_limit','memory_limit'] if k in limits})+'\n\n'+prompt
+    hint=hidden_hint(cfg,problem,repeat)
+    if hint:initial+='\n\nRound 2 hint:\n'+hint
     fingerprint=sha(json.dumps({'settings':protocol_config(cfg,model,problem,prompt),
                                'model':{k:v for k,v in model.items() if 'password' not in k},
                                'problem':problem,'prompt':initial,'metadata':metadata},sort_keys=True))
@@ -147,12 +226,13 @@ def run_job(cfg,model,problem,repeat,dj,lm,metadata):
     else:
         state={'fingerprint':fingerprint,'model':model['label'],'model_id':model['identifier'],
                'problem':problem['slug'],'judge_problem_id':str(problem['judge_id']),
-               'repeat':repeat,'status':'RUNNING','created_at':now(),'metadata':metadata,
+               'repeat':repeat,'provider':provider_name(model),'hint_used':bool(hint),
+               'status':'RUNNING','created_at':now(),'metadata':metadata,
                'settings':protocol_config(cfg,model,problem,prompt),'model_notes':model.get('notes',''),
                'messages':[{'role':'user','content':initial}],'attempts':[]}
         save_state(folder,state)
     if state['status'] in ['ACCEPTED','EXHAUSTED']:return
-    while len(state['attempts'])<cfg.get('attempts',3) or (state['attempts'] and state['attempts'][-1]['status']!='DONE'):
+    while len(state['attempts'])<cfg.get('attempts',10) or (state['attempts'] and state['attempts'][-1]['status']!='DONE'):
         if state['attempts'] and state['attempts'][-1]['status']!='DONE':
             attempt=state['attempts'][-1]
         else:
@@ -162,18 +242,14 @@ def run_job(cfg,model,problem,repeat,dj,lm,metadata):
         if attempt['status']=='SUBMITTING':
             raise HarnessError('Submission outcome is unknown. Inspect DOMjudge, then use attach-submission; automatic resubmission is disabled.')
         if attempt['status']=='GENERATING':
-            payload={'model':model['identifier'],'messages':state['messages'],
-                     'temperature':cfg.get('temperature',0.2),'top_p':cfg.get('top_p',0.95),
-                     'max_tokens':cfg.get('max_tokens',4096),'stream':False,
-                     'seed':cfg.get('seed',2202)+repeat-1}
+            payload=generation_payload(cfg,model,generation_messages(state),repeat,getattr(lm,'model_id',None))
             atomic_json(folder/(prefix+'-request.json'),payload)
-            started=time.monotonic();response=lm.call('POST','chat/completions',payload)
+            started=time.monotonic();response=generation_call(lm,model,payload,cfg,ApiError)
             attempt['generation_s']=time.monotonic()-started
             atomic_json(folder/(prefix+'-response.json'),response)
             content=''
             try:
-                choice=response['choices'][0];content=choice['message'].get('content','')
-                attempt['usage']=response.get('usage',{});attempt['finish_reason']=choice.get('finish_reason')
+                content,attempt['usage'],attempt['finish_reason']=response_content(response,model)
                 if attempt['finish_reason']=='length':raise HarnessError('Model reached the output-token limit.')
                 code=extract_cpp(content)
             except (KeyError,IndexError,TypeError,HarnessError) as exc:
@@ -217,6 +293,103 @@ def run_job(cfg,model,problem,repeat,dj,lm,metadata):
     if state['status']!='ACCEPTED':state['status']='EXHAUSTED'
     state['completed_at']=now();save_state(folder,state)
 
+def job_folder(cfg,model,problem,repeat):
+    return Path(cfg['_root'])/cfg.get('output_directory','results')/model['label']/problem['slug']/f'repeat-{repeat:02d}'
+
+def read_job(cfg,model,problem,repeat):
+    path=job_folder(cfg,model,problem,repeat)/'state.json'
+    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
+
+def is_solved(cfg,model,problem):
+    return any((read_job(cfg,model,problem,n) or {}).get('status')=='ACCEPTED'
+               for n in range(1,cfg.get('repetitions',2)+1))
+
+def easiest_problem(problems):
+    # Stable config order breaks ties and is the fallback when difficulty is unknown.
+    return min(problems,key=lambda p:p.get('difficulty') if p.get('difficulty') is not None else float('inf'))
+
+def select_problem(cfg,model,problems,repeat,lm,folder,index):
+    policy=cfg.get('problem_selection','model')
+    if policy=='configured':return problems[0]
+    if policy=='easiest':return easiest_problem(problems)
+    # Construct a public-only view explicitly. Hints/references/test metadata never enter selection.
+    public=[{'slug':p['slug'],'name':p.get('name',p['slug']),'difficulty':p.get('difficulty'),
+             'statement':(Path(cfg['_root'])/p['statement']).read_text(encoding='utf-8')} for p in problems]
+    instruction=('Choose the easiest problem for you to solve from these unsolved candidates. '
+                 'Lower numeric difficulty means easier; null means unknown. '
+                 'Return ONLY a JSON object with one key, "problem", containing an exact candidate slug.\n\n')
+    payload=generation_payload(cfg,model,[{'role':'user','content':instruction+json.dumps(public,ensure_ascii=False)}],
+                               repeat,getattr(lm,'model_id',None),selection=True)
+    atomic_json(folder/f'selection-{index:03d}-request.json',payload)
+    response=generation_call(lm,model,payload,cfg,ApiError)
+    atomic_json(folder/f'selection-{index:03d}-response.json',response)
+    try:
+        content,_,reason=response_content(response,model)
+        if reason=='length':raise ValueError()
+        content=re.sub(r'<think>.*?</think>','',content,flags=re.S).strip()
+        content=re.sub(r'^```(?:json)?\s*|\s*```$','',content).strip()
+        slug=json.loads(content)['problem']
+        return next(p for p in problems if p['slug']==slug)
+    except (KeyError,IndexError,TypeError,ValueError,StopIteration):
+        print('Invalid problem selection; using configured difficulty/order fallback.',flush=True)
+        return easiest_problem(problems)
+
+def run_contest(cfg,models,problems,repetitions):
+    out=Path(cfg['_root'])/cfg.get('output_directory','results');out.mkdir(parents=True,exist_ok=True)
+    # Resolve credentials and validate every selected team before a long unattended run.
+    clients={};metadata={}
+    for model in models:
+        if not isinstance(model.get('identifier'),str) or not model['identifier'] or model['identifier'].startswith('REPLACE_'):
+            raise HarnessError('Set the exact provider model identifier for '+model['label']+'.')
+        clients[model['label']]=dom_client(cfg,model)
+        for p in problems:
+            metadata[(model['label'],p['slug'])]=validate_problem(clients[model['label']],cfg,p)
+        model_client(cfg,model)  # Check cloud credentials before any generation.
+    if repetitions[0]==2:
+        for model in models:
+            if any((read_job(cfg,model,p,1) or {}).get('status') not in ['ACCEPTED','EXHAUSTED'] for p in problems):
+                raise HarnessError('Finish round 1 before selecting --repeat 2; run without --repeat to do both.')
+    manifest_path=out/'contest.json'
+    settings={k:v for k,v in cfg.items() if k not in ['_root','output_directory']}
+    fingerprint=sha(json.dumps({'config':settings,
+        'prompts':{p['slug']:sha((Path(cfg['_root'])/p['statement']).read_text(encoding='utf-8')) for p in cfg['problems']}},sort_keys=True))
+    if manifest_path.exists():
+        manifest=json.loads(manifest_path.read_text(encoding='utf-8'))
+        if manifest['config_fingerprint']!=fingerprint:
+            raise HarnessError('Configuration changed for this contest (settings or prompts). Use a new output_directory.')
+    else:
+        manifest={'config_fingerprint':fingerprint,'created_at':now(),'metadata_fingerprints':{},'jobs':[]}
+    for key,value in metadata.items():
+        name='/'.join(key);digest=sha(json.dumps(value,sort_keys=True))
+        if name in manifest['metadata_fingerprints'] and manifest['metadata_fingerprints'][name]!=digest:
+            raise HarnessError('Configuration changed: judge metadata differs. Use a new output_directory.')
+        manifest['metadata_fingerprints'][name]=digest
+    atomic_json(manifest_path,manifest)
+    for repeat in repetitions:
+        for model in models:
+            candidates=[p for p in problems if not is_solved(cfg,model,p)
+                        and (read_job(cfg,model,p,repeat) or {}).get('status')!='EXHAUSTED']
+            if not candidates:continue
+            print(f'Round {repeat}/{cfg.get("repetitions",2)}: {model["label"]}, {len(candidates)} unsolved problems.',flush=True)
+            with model_session(cfg,model) as lm:
+                while candidates:
+                    # Resume a persisted job before asking the model to choose again.
+                    pending=[p for p in candidates if read_job(cfg,model,p,repeat)]
+                    scheduled=[j for j in manifest['jobs'] if j['model']==model['label'] and j['repeat']==repeat
+                               and any(p['slug']==j['problem'] for p in candidates)]
+                    if pending:problem=pending[0]
+                    elif scheduled:problem=next(p for p in candidates if p['slug']==scheduled[0]['problem'])
+                    else:
+                        folder=out/model['label']/f'round-{repeat:02d}'
+                        index=1+sum(j['model']==model['label'] and j['repeat']==repeat for j in manifest['jobs'])
+                        problem=select_problem(cfg,model,candidates,repeat,lm,folder,index)
+                        manifest['jobs'].append({'model':model['label'],'repeat':repeat,'problem':problem['slug'],'selected_at':now()})
+                        atomic_json(manifest_path,manifest)
+                    print(f'{model["label"]} chose {problem["slug"]} in round {repeat}.',flush=True)
+                    run_job(cfg,model,problem,repeat,clients[model['label']],lm,metadata[(model['label'],problem['slug'])])
+                    candidates=[p for p in candidates if p['slug']!=problem['slug']]
+    manifest['updated_at']=now();atomic_json(manifest_path,manifest)
+
 def export(cfg):
     out=Path(cfg['_root'])/cfg.get('output_directory','results');out.mkdir(parents=True,exist_ok=True)
     runs=[];attempts=[]
@@ -227,6 +400,7 @@ def export(cfg):
         gen=sum(a.get('generation_s',0) for a in done)
         waits=sum(a.get('judge_poll_wait_s',0) for a in done)
         runs.append(dict(model=s['model'],model_id=s['model_id'],problem=s['problem'],repeat=s['repeat'],
+                         provider=s.get('provider','lmstudio'),hint_used=s.get('hint_used',False),
                          status=s['status'],accepted=accepted,first_accepted=int(bool(done) and done[0].get('verdict')=='AC') if complete else None,
                          attempts_used=len(s['attempts']),attempts_to_accept=len(done) if accepted else None,
                          observed_generation_s=gen,observed_poll_wait_s=waits,
@@ -245,20 +419,35 @@ def export(cfg):
     for model in sorted({m['label'] for m in cfg['models']} | {r['model'] for r in runs}):
         rows=[r for r in runs if r['model']==model];complete=[r for r in rows if r['accepted'] is not None]
         n=len(complete);k=sum(r['accepted'] for r in complete);first=sum(r['first_accepted'] for r in complete)
-        configured=len(cfg['problems'])*cfg.get('repetitions',1)
+        configured=len(cfg['problems'])*cfg.get('repetitions',2)
         summary.append(dict(model=model,configured_runs=configured,started_runs=len(rows),completed_runs=n,incomplete_started_runs=len(rows)-n,
             accepted=k,first_accepted=first,acceptance_rate=k/n if n else None,
             first_acceptance_rate=first/n if n else None,
             median_observed_generation_s=statistics.median(r['observed_generation_s'] for r in complete) if n else None,
             note='Descriptive run-level rates. Repetitions share problems; do not treat them as independent problems.'))
     atomic_json(out/'summary.json',summary)
+    scoreboard=[]
+    for model in cfg['models']:
+        rows=[r for r in runs if r['model']==model['label']]
+        solved=sorted({r['problem'] for r in rows if r['accepted']})
+        unassisted=sorted({r['problem'] for r in rows if r['accepted'] and not r['hint_used']})
+        unsolved=[p['slug'] for p in cfg['problems'] if p['slug'] not in solved]
+        exhausted=[slug for slug in unsolved if all(any(r['problem']==slug and r['repeat']==n and r['status']=='EXHAUSTED' for r in rows)
+                    for n in range(1,cfg.get('repetitions',2)+1))]
+        scoreboard.append(dict(model=model['label'],enabled=model.get('enabled',True),solved=len(solved),
+            total_problems=len(cfg['problems']),solved_problems=solved,solved_without_hint=unassisted,
+            unsolved_problems=unsolved,exhausted_problems=exhausted,
+            contest_complete=len(solved)+len(exhausted)==len(cfg['problems']),
+            attempts_used=sum(r['attempts_used'] for r in rows)))
+    atomic_json(out/'scoreboard.json',scoreboard)
     print('Results exported to '+str(out))
 
 def main(argv=None):
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--config',default='config.json')
     sub=ap.add_subparsers(dest='command',required=True)
     doctor_p=sub.add_parser('doctor');doctor_p.add_argument('--model',default='qwen')
-    run=sub.add_parser('run');run.add_argument('--model',required=True);run.add_argument('--problem');run.add_argument('--repeat',type=int)
+    run=sub.add_parser('run');run.add_argument('--model',help='One model label; omitted runs all enabled models')
+    run.add_argument('--problem');run.add_argument('--repeat',type=int)
     smoke=sub.add_parser('submit-file');smoke.add_argument('--model',default='qwen');smoke.add_argument('--problem',required=True);smoke.add_argument('--file',required=True)
     sub.add_parser('export')
     attach=sub.add_parser('attach-submission');attach.add_argument('--state',required=True);attach.add_argument('--submission-id',required=True)
@@ -280,8 +469,8 @@ def main(argv=None):
         if Path(args.source_file).read_text(encoding='utf-8')!=(f.parent/f'attempt-{a["number"]:02d}.cpp').read_text(encoding='utf-8'):
             raise HarnessError('Submission source differs from the pending attempt; do not attach it.')
         a.update(status='PENDING',submission_id=str(response['id']));atomic_json(f,s);return
-    model=get_model(cfg,args.model);dj=dom_client(cfg,model)
     if args.command=='submit-file':
+        model=get_model(cfg,args.model);dj=dom_client(cfg,model)
         candidates=[p for p in cfg['problems'] if p['slug']==args.problem]
         if len(candidates)!=1:raise HarnessError('Unknown configured problem slug: '+args.problem)
         problem=candidates[0];validate_problem(dj,cfg,problem)
@@ -289,18 +478,14 @@ def main(argv=None):
         result=dj.call('POST',contest_path(cfg['contest_id'],'submissions'),submission_payload(problem['judge_id'],cfg['language_id'],source))
         print('Submission ID:',result['id']);judgement,_=wait_for_judgement(dj,cfg,str(result['id']))
         print(json.dumps(judgement,indent=2));return
-    if not model.get('identifier') or model['identifier'].startswith('REPLACE_'):
-        raise HarnessError('Set identifier to the exact model ID returned by LM Studio in doctor output.')
-    lm=lm_client(cfg);visible=lm.call('GET','models').get('data',[])
-    if not any(m.get('id')==model['identifier'] for m in visible):raise HarnessError('Configured model ID is not visible in LM Studio.')
+    models=[get_model(cfg,args.model)] if args.model else [m for m in cfg['models'] if m.get('enabled',True)]
+    if not models:raise HarnessError('Enable at least one model in config.json.')
     problems=[p for p in cfg['problems'] if not args.problem or p['slug']==args.problem]
     if not problems:raise HarnessError('No matching configured problem.')
-    repetitions=[args.repeat] if args.repeat else list(range(1,cfg.get('repetitions',1)+1))
-    if any(n<1 or n>cfg.get('repetitions',1) for n in repetitions):raise HarnessError('Repetition is outside configured range.')
+    repetitions=[args.repeat] if args.repeat is not None else list(range(1,cfg.get('repetitions',2)+1))
+    if any(n<1 or n>cfg.get('repetitions',2) for n in repetitions):raise HarnessError('Repetition is outside configured range.')
     try:
-        for p in problems:
-            metadata=validate_problem(dj,cfg,p)
-            for repeat in repetitions:run_job(cfg,model,p,repeat,dj,lm,metadata)
+        run_contest(cfg,models,problems,repetitions)
     finally:export(cfg)
 
 if __name__=='__main__':
@@ -309,3 +494,4 @@ if __name__=='__main__':
         print('Stopped:',str(exc),file=sys.stderr);sys.exit(1)
     except KeyboardInterrupt:
         print('Interrupted. Rerun the same command to resume persisted runs.',file=sys.stderr);sys.exit(130)
+
