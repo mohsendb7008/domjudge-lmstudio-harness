@@ -69,7 +69,9 @@ Difficulty defaults to `null`; no official difficulty ranking is supplied. An in
 
 ### Round-two hidden hints
 
-Fill a problem's `hidden_hint` in `config.json`, or add a top-level mapping:
+The starter config now includes a one-paragraph algorithm hint for each of the 11 NCPC 2025 problems under `hidden_hints`. Read [NCPC_2025_HINTS.md](NCPC_2025_HINTS.md) for the approaches, pitfalls, and C++17 language advice. These are strong outlines checked against the supplied public statements and reference approaches. Use a new `output_directory` to enable or change them after a contest has started; clearing the mapping and per-problem hints disables hint assistance.
+
+Customize a problem's `hidden_hint` in `config.json`, or edit the top-level mapping:
 
 ```json
 "hidden_hints": {
@@ -77,7 +79,7 @@ Fill a problem's `hidden_hint` in `config.json`, or add a top-level mapping:
 }
 ```
 
-A nonempty per-problem hint takes precedence over the mapping. The hint is appended to the solving prompt **only in round 2**. It never enters round-1 solving prompts or any problem-selection prompt. Empty hints are allowed. Round 2 starts fresh with the statement and hint, without round-1 conversation history. These are user-authored hints, not information extracted from hidden judge tests. Round-two request/state files contain the hint once it has been used; “hidden” refers to withholding it from earlier model prompts, not encryption of configuration or result files.
+A nonempty per-problem hint takes precedence over the mapping. The hint is appended to the solving prompt **only in round 2**. It never enters round-1 solving prompts or any problem-selection prompt. Empty hints are allowed. Round 2 starts fresh with the statement and hint, without round-1 conversation history. The supplied hints describe public algorithmic approaches, not hidden judge tests. Round-two request/state files contain the hint once it has been used; “hidden” refers to withholding it from earlier model prompts, not encryption of configuration or result files.
 
 ### Providers and API keys
 
