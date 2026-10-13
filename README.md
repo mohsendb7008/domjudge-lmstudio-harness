@@ -6,23 +6,23 @@ This bundle contains 11 individual NCPC 2025 problem imports, public problem pro
 
 The original problemset archive exceeds Git's 25M `post_max_size`. Extract **instagraph.7z** in imports folder. In the DOMjudge jury interface, import **one ZIP from `imports/` at a time**, starting with `arithmeticadaptation.zip`. The largest individual import is approximately 35 MB, comfortably below the DOMServer limit. The packages have their problem files at the ZIP root.
 
-Create a contest, add the problems, enable submissions and judging, and set a contest window that covers the experiment. Create a team and linked **team user** named `llm-qwen`, and assign the team to the contest. Create a separate team/user for each additional model, such as `llm-gemma`, `llm-openai`, or `llm-claude`. The judgehost account is for the daemon; use team accounts for the harness. Confirm that your judgehost is active.
+Create a contest, add the problems, enable submissions and judging, and set a contest window that covers the experiment. Create a separate team and linked **team user** for each configured model, using the usernames in the model table below, and assign every team to the contest. The judgehost account is for the daemon; use team accounts for the harness. Confirm that your judgehost is active.
 
 The supplied source archive has no official numeric per-problem time limit. DOMjudge 9's importer defaults a missing time limit to 10 seconds; that is an importer default, not an NCPC contest setting. Review time, memory, output and language limits. Calibrate them using the supplied reference solutions before collecting results, and freeze them across models. Inspect each reference verdict; an internal error or a rejected reference solution means the contest is not ready. Calibration submissions are separate from the harness's LLM results.
 
 ## 2. Install and load a model
 
-Start with **Qwen2.5-Coder-7B-Instruct, GGUF Q4_K_M**, subject to available memory. For a second family, try **Gemma 3 4B IT, GGUF Q4_K_M**. They differ in size: this initial comparison is of practical local configurations, rather than equal-sized architectures. Start LM Studio's local server on port **1234**. The supplied config uses manual loading: keep Qwen and Gemma loaded before running both. Its model `context_length` values are 32768, but with `auto_load_models: false` you must configure the actual context size in LM Studio. If you switch to automatic loading, the runner passes that value to the native loader. Adjust `context_length` and `max_tokens` to your model and available memory. Download each local model before the batch; automatic loading does not download models.
+Start with **Qwen2.5-Coder-7B-Instruct, GGUF Q4_K_M**, subject to available memory. For a second family, try **Gemma 3 4B IT, GGUF Q4_K_M**. They differ in size: this initial comparison is of practical local configurations, rather than equal-sized architectures. Start LM Studio's local server on port **1234**. The supplied config uses manual loading and enables six local models. Make each selected model available through LM Studio before its worker starts. The two-worker limit does not unload manually loaded models, so choose resident models and GPU offload to fit available RAM/VRAM; use `--model LABEL` to run one model at a time if needed. Its model `context_length` values are 32768, but with `auto_load_models: false` you must configure the actual context size in LM Studio. If you switch to automatic loading, the runner passes that value to the native loader. Adjust `context_length` and `max_tokens` to your model and available memory. Download each local model before the batch; automatic loading does not download models.
 
 ## 3. Configure and check the connection
 
 Open a terminal **inside the `domjudge-lmstudio-harness` folder**. The commands below work with `python`; use `python3` on systems where that is the installed command.
 
 ```text
-python harness.py doctor --model qwen
+python harness.py doctor --model llm-qwen2
 ```
 
-Enter the `llm-qwen` team's password privately when asked. Alternatively, set the model's `password_env` (for example, `DOMJUDGE_PASSWORD_QWEN`) in that terminal; credentials are not saved in result files. `DOMJUDGE_USER` overrides the configured username, so leave it unset when switching between configured team users.
+Enter the selected team's password privately when asked. All six supplied entries use `password_env: DOMJUDGE_PASSWORD`; set that variable before an unattended run only if all selected team accounts use the same password. For different passwords, assign separate environment-variable names to the model entries and set each variable. Credentials are not saved in result files. `DOMJUDGE_USER` overrides the configured username, so leave it unset when switching between configured team users.
 
 Edit `config.json` with the contest ID, enabled C++ language ID, and Qwen's LM Studio model ID printed by `doctor`. Ensure the selected DOMjudge C++ compilation command uses C++17. Run `doctor` again to inspect the team's contest account and problem IDs. The starter assumes problem IDs match the imported external IDs; if your installation returns other IDs, update each `judge_id` to the value displayed. Keep all other settings unchanged for the pilot.
 
@@ -36,24 +36,37 @@ Default endpoints, when running the harness on the same computer:
 Submit one known reference solution to check the judge:
 
 ```text
-python harness.py submit-file --model qwen --problem arithmeticadaptation --file reference_solutions/arithmeticadaptation.cpp
+python harness.py submit-file --model llm-qwen2 --problem arithmeticadaptation --file reference_solutions/arithmeticadaptation.cpp
 ```
 
 An **AC** is the expected outcome. Then run a single LLM pilot:
 
 ```text
-python harness.py run --model qwen --problem arithmeticadaptation --repeat 1
+python harness.py run --model llm-qwen2 --problem arithmeticadaptation --repeat 1
 ```
 
 ## 4. Run an unattended contest
 
-After checking imports and references, configure each model you want to run: set `enabled` to `true`, its exact `identifier`, and its DOMjudge team. The supplied config enables Qwen (`qwen2.5-coder-7b-instruct`) and Gemma (`gemma-3-4b-it`); the cloud examples remain disabled. Set all enabled teams' password environment variables before starting so the batch needs no later prompts. For a single-model pilot, `--model LABEL` explicitly selects that model even if disabled.
+After checking imports and references, configure each model you want to run: set `enabled` to `true`, its exact `identifier`, and its DOMjudge team. The supplied config enables these six local models; each label also matches its DOMjudge username:
+
+| Label / team username | LM Studio identifier |
+| --- | --- |
+| `llm-gemma3n` | `google/gemma-3n-e4b` |
+| `llm-gemma3` | `gemma-3-4b-it` |
+| `llm-qwen2` | `qwen2.5-coder-7b-instruct` |
+| `llm-qwen3` | `deepseek/deepseek-r1-0528-qwen3-8b` |
+| `llm-gpt-oss` | `openai/gpt-oss-20b` |
+| `llm-qwen3moe` | `qwen3-coder-30b-a3b-instruct` |
+
+`llm-qwen3` is the DeepSeek R1 distillation built on Qwen3-8B, and `llm-gpt-oss` runs locally through LM Studio. Use the exact API identifiers shown by your LM Studio installation.
+
+Set all enabled teams' password environment variables before starting so the batch needs no later prompts. For a single-model pilot, `--model LABEL` explicitly selects that model even if disabled.
 
 ```text
 python harness.py run
 ```
 
-The supplied config runs Qwen and Gemma concurrently, with **three rounds and up to three attempts per problem per round**. Each model chooses a problem and completes round 1, then round 2, then round 3 before choosing another problem. Acceptance immediately skips all remaining attempts and rounds for that model/problem. A problem solved by one model remains available to other models. Completion means every problem is accepted or has exhausted all configured rounds; acceptance of every problem is not guaranteed. `repetitions` supports 1-100 rounds, and `attempts` supports 1-10 attempts per round.
+The supplied config runs up to two of the six models concurrently, with **three rounds and up to three attempts per problem per round**. Each model chooses a problem and completes round 1, then round 2, then round 3 before choosing another problem. Acceptance immediately skips all remaining attempts and rounds for that model/problem. A problem solved by one model remains available to other models. Completion means every problem is accepted or has exhausted all configured rounds; acceptance of every problem is not guaranteed. `repetitions` supports 1-100 rounds, and `attempts` supports 1-10 attempts per round.
 
 Each problem/round starts a fresh conversation. Failed attempts within that conversation receive the statement, latest response, and latest DOMjudge verdict. The full conversation audit remains on disk, while inference sends only the latest repair exchange to avoid accumulating ten large solutions in the context window. The requested local seed varies by round; seeds do not guarantee reproducibility across backends or hardware. Generation, submission, and verdict feedback stay sequential within each model; different model workers overlap. Runtime depends on model speed, response budgets, retries, and the judge queue; no fixed few-hour completion time is guaranteed.
 
@@ -95,23 +108,25 @@ A nonempty per-problem hint takes precedence over the mapping. The hint is appen
 | `openai` | Exact OpenAI API model ID | `OPENAI_API_KEY` |
 | `anthropic` | Exact Claude API model ID | `ANTHROPIC_API_KEY` |
 
-The sample config includes disabled `openai` and `claude` entries. Replace their identifier placeholders, create their DOMjudge teams, supply the API keys and team passwords, and enable them. Use provider API keys for these calls. `api_key_env` and `api_base` allow a model-specific key environment variable and endpoint. Keys travel in HTTP headers and are not written to request, response, or state files. Never place literal API keys in configuration. Cloud inference and selection requests use your provider account's API quota.
+The supplied config contains only local models. To add OpenAI or Claude, add a model entry with the matching `provider`, exact API `identifier`, unique `label`, DOMjudge `username`, `password_env`, `api_key_env`, and `enabled: true`, then create its DOMjudge team and set its credentials. Use provider API keys for these calls. `api_key_env` and `api_base` allow a model-specific key environment variable and endpoint. Keys travel in HTTP headers and are not written to request, response, or state files. Never place literal API keys in configuration. Cloud inference and selection requests use your provider account's API quota.
 
 LM Studio uses its OpenAI-compatible Chat Completions endpoint, OpenAI uses Chat Completions with `max_completion_tokens`, and Claude uses its native Messages endpoint. Global `temperature`, `top_p`, and `seed` apply to LM Studio. Cloud defaults omit these parameters because support depends on the chosen model. Optional per-model cloud settings include `temperature`/`top_p` where supported; OpenAI supports `reasoning_effort`, and Claude supports `thinking`/`output_config`. Record and verify settings for your selected model; reasoning may consume the output budget. For Claude with an explicit thinking budget, selector output budgets are raised when needed to leave room beyond the thinking tokens. Cloud keys are checked before the batch; model availability is validated by the provider on inference.
 
 `auto_load_models: true` loads each active local model through LM Studio's native `/api/v1/models/load`, uses its returned instance ID for inference, and unloads it after that model's entire problem sequence, including ordinary failure/interrupt cleanup. This requires an LM Studio server supporting the native v1 management API. Configure `lmstudio_management_api` separately if the server is remote. Start with other manually loaded models unloaded so they do not consume the batch's memory budget. For older servers or manual loading, set `auto_load_models` to `false`; each requested model must then be available through `/v1/models`.
+
+The supplied `generation_timeout_s` is 1800 seconds (30 minutes), with an output limit of 9096 tokens. A longer timeout lets slow generations finish but does not expand that output budget: reasoning models may exhaust it before returning complete code. Inspect the saved response and attempt error before changing the budget.
 
 Transient inference errors (rate limiting, temporary server errors, and connection failures) use bounded retries with exponential backoff. `generation_retries` defaults to 3. Retry calls do not consume extra solution attempts, though a provider might charge a generation whose response was lost. DOMjudge submissions are never blindly retried after an ambiguous outcome.
 
 You can narrow or stage the same contest:
 
 ```text
-python harness.py run --model qwen --problem arithmeticadaptation --repeat 1
-python harness.py run --model qwen
-python harness.py run --model claude --repeat 1
+python harness.py run --model llm-qwen2 --problem arithmeticadaptation --repeat 1
+python harness.py run --model llm-qwen2
+python harness.py run --model llm-gpt-oss --repeat 1
 ```
 
-`--repeat N` runs only that round and requires all earlier rounds of the selected unsolved problems to be finished. Omit `--repeat` to complete all rounds of one problem before moving on. Settings, hints, prompts, and judge metadata are frozen once a contest starts; use a new output directory to change them. The two worker-limit settings can be adjusted on resume and are recorded in `contest.json` under `executions`. Older `contest.json` files used round-first scheduling and require a fresh `output_directory`; the runner does not mix those results with this schedule. The supplied directory is `results-contest2`; if it already contains a legacy contest, use a new name such as `results-contest3`.
+`--repeat N` runs only that round and requires all earlier rounds of the selected unsolved problems to be finished. Omit `--repeat` to complete all rounds of one problem before moving on. Settings, hints, prompts, and judge metadata are frozen once a contest starts; use a new output directory to change them. The two worker-limit settings can be adjusted on resume and are recorded in `contest.json` under `executions`. Older `contest.json` files used round-first scheduling and require a fresh `output_directory`; the runner does not mix those results with this schedule. The supplied directory is `results-contest2`; if it contains results from a different model lineup, timeout, or other configuration (including a legacy contest), choose a fresh directory before starting this configuration.
 
 ## 5. Results and interpretation
 
@@ -138,7 +153,7 @@ The prompt files contain original LaTeX statement text and public samples. Illus
 Test the model separately from DOMjudge and the contest prompts:
 
 ```text
-python harness.py probe-model --model gemma
+python harness.py probe-model --model llm-gemma3
 ```
 
 Use your configured model label. This makes one short inference request with the configured loading mode and API credentials; it does not ask for a DOMjudge password, submit code, or change saved contest state. Cloud probes use the API and incur normal usage charges. A successful probe confirms a small request works; it does not guarantee enough context or memory for contest prompts.
@@ -148,7 +163,7 @@ Inference HTTP errors now include the provider's structured error message/code, 
 If a probe succeeds but the run stops during **problem selection**, the selector request contains every remaining public statement. A context or memory error may require a larger loaded context or a smaller request. To test the smaller request, set `problem_selection` to `easiest`, reduce `max_tokens` to `4096` (including a per-model override if present), and choose a fresh `output_directory`, such as `results-gemma-pilot`. Then run a single problem:
 
 ```text
-python harness.py run --model gemma --problem arithmeticadaptation --repeat 1
+python harness.py run --model llm-gemma3 --problem arithmeticadaptation --repeat 1
 ```
 
 With manual loading (`auto_load_models: false`), configure the actual context size in LM Studio; the harness's model `context_length` applies only to automatic loading. `easiest` uses configured numeric difficulty and falls back to config order when difficulty is unknown. This bypasses model-based selection. It is a diagnostic experiment, not a guaranteed fix for a runtime or template failure.

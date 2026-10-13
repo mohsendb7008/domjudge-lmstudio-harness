@@ -12,14 +12,14 @@
   "seed": 2202,
   "poll_interval_s": 2,
   "judge_timeout_s": 600,
-  "generation_timeout_s": 600,
+  "generation_timeout_s": 1800,
   "api_timeout_s": 60,
   "models": [
     {
-      "label": "qwen",
-      "identifier": "qwen2.5-coder-7b-instruct",
-      "username": "llm-qwen",
-      "password_env": "DOMJUDGE_PASSWORD_QWEN",
+      "label": "llm-gemma3n",
+      "identifier": "google/gemma-3n-e4b",
+      "username": "llm-gemma3n",
+      "password_env": "DOMJUDGE_PASSWORD",
       "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version, GPU offload and thinking mode.",
       "provider": "lmstudio",
       "enabled": true,
@@ -27,33 +27,59 @@
       "context_length": 32768
     },
     {
-      "label": "gemma",
+      "label": "llm-gemma3",
       "identifier": "gemma-3-4b-it",
-      "username": "llm-gemma",
-      "password_env": "DOMJUDGE_PASSWORD_GEMMA",
-      "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version and GPU offload.",
+      "username": "llm-gemma3",
+      "password_env": "DOMJUDGE_PASSWORD",
+      "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version, GPU offload and thinking mode.",
       "provider": "lmstudio",
       "enabled": true,
       "api_key_env": "LMSTUDIO_API_KEY",
       "context_length": 32768
     },
     {
-      "label": "openai",
-      "provider": "openai",
-      "enabled": false,
-      "identifier": "gpt-5.5",
-      "username": "llm-chatgpt",
-      "password_env": "DOMJUDGE_PASSWORD_OPENAI",
-      "api_key_env": "OPENAI_API_KEY"
+      "label": "llm-qwen2",
+      "identifier": "qwen2.5-coder-7b-instruct",
+      "username": "llm-qwen2",
+      "password_env": "DOMJUDGE_PASSWORD",
+      "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version, GPU offload and thinking mode.",
+      "provider": "lmstudio",
+      "enabled": true,
+      "api_key_env": "LMSTUDIO_API_KEY",
+      "context_length": 32768
     },
     {
-      "label": "claude",
-      "provider": "anthropic",
-      "enabled": false,
-      "identifier": "REPLACE_WITH_CLAUDE_MODEL_ID",
-      "username": "llm-claude",
-      "password_env": "DOMJUDGE_PASSWORD_CLAUDE",
-      "api_key_env": "ANTHROPIC_API_KEY"
+      "label": "llm-qwen3",
+      "identifier": "deepseek/deepseek-r1-0528-qwen3-8b",
+      "username": "llm-qwen3",
+      "password_env": "DOMJUDGE_PASSWORD",
+      "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version, GPU offload and thinking mode.",
+      "provider": "lmstudio",
+      "enabled": true,
+      "api_key_env": "LMSTUDIO_API_KEY",
+      "context_length": 32768
+    },
+    {
+      "label": "llm-gpt-oss",
+      "identifier": "openai/gpt-oss-20b",
+      "username": "llm-gpt-oss",
+      "password_env": "DOMJUDGE_PASSWORD",
+      "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version, GPU offload and thinking mode.",
+      "provider": "lmstudio",
+      "enabled": true,
+      "api_key_env": "LMSTUDIO_API_KEY",
+      "context_length": 32768
+    },
+    {
+      "label": "llm-qwen3moe",
+      "identifier": "qwen3-coder-30b-a3b-instruct",
+      "username": "llm-qwen3moe",
+      "password_env": "DOMJUDGE_PASSWORD",
+      "notes": "Fill in exact GGUF filename, quantization, context size, GPU, VRAM, RAM, LM Studio version, GPU offload and thinking mode.",
+      "provider": "lmstudio",
+      "enabled": true,
+      "api_key_env": "LMSTUDIO_API_KEY",
+      "context_length": 32768
     }
   ],
   "problems": [
